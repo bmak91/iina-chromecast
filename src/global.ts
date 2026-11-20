@@ -103,7 +103,11 @@ global.onMessage("cast:devices", (_d, player) => {
     .get(`${CONTROL}/devices`, { params: {}, headers: { "X-Cast-Token": token }, data: {} })
     .then((res) => {
       const body = JSON.parse((res && res.text) || "{}");
-      reply({ ok: true, devices: Array.isArray(body.devices) ? body.devices : [] });
+      reply({
+        ok: true,
+        devices: Array.isArray(body.devices) ? body.devices : [],
+        casting: body.casting === true,
+      });
     })
     .catch(() => reply({ ok: false }));
 });

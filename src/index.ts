@@ -37,19 +37,25 @@ function rebuildMenu() {
 
   const root = menu.item("Chromecast", () => {});
   if (devices.length === 0) {
-    root.addSubMenuItem(
-      menu.item(scanned ? "No Devices Found" : "Scanning...", () => {}, { enabled: false })
-    );
+    root.addSubMenuItem(disabledItem(scanned ? "No Devices Found" : "Scanning..."));
   }
   for (const d of devices) {
     root.addSubMenuItem(menu.item(d.name, () => castCurrent(d.address)));
   }
   root.addSubMenuItem(menu.separator());
-  root.addSubMenuItem(menu.item("Stop Casting", () => stopCasting(), { enabled: casting }));
+  root.addSubMenuItem(
+    casting ? menu.item("Stop Casting", () => stopCasting()) : disabledItem("Stop Casting")
+  );
 
   menu.removeAllItems();
   menu.addItem(root);
   menu.forceUpdate();
+}
+
+// macOS enables every submenu item that has an action, whatever its "enabled"
+// flag says. An item only shows as greyed out when it has no action at all.
+function disabledItem(title: string) {
+  return menu.item(title, null as any, { enabled: false });
 }
 
 function setDevices(list: Device[]) {
@@ -64,8 +70,13 @@ function refreshDevices() {
   global.postMessage("cast:devices", {});
 }
 
-global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[] }) => {
+global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[]; casting?: boolean }) => {
   onMain(() => {
+    // The session ended on the device (stopped with the TV remote, TV off...).
+    if (r.ok && r.casting === false && casting && castConfirmed) {
+      endCasting();
+      core.osd("Chromecast: casting ended");
+    }
     const list: Device[] = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
       name: String(d.name),
       address: `${d.ip}:${d.port}`,
@@ -121,11 +132,38 @@ IINAEvent.on("iina.window-loaded", () => {
   }, 4000);
 });
 
+// While casting, IINA is only the remote control: the local player stays
+// paused and muted, and play/pause and seeking are sent to the device.
 let casting = false;
+let castConfirmed = false; // the device accepted the media
+let tvPaused = false;
+let wasMuted = false;
 
 function setCasting(on: boolean) {
   casting = on;
   rebuildMenu(); // enables or disables "Stop Casting"
+}
+
+function beginCasting() {
+  if (!casting) {
+    try {
+      wasMuted = mpv.getFlag("mute");
+      mpv.set("mute", true);
+    } catch (e) {}
+  }
+  castConfirmed = false;
+  tvPaused = false;
+  setCasting(true);
+  core.pause();
+}
+
+function endCasting() {
+  if (!casting) return;
+  setCasting(false);
+  castConfirmed = false;
+  try {
+    mpv.set("mute", wasMuted);
+  } catch (e) {}
 }
 
 // What is playing: a local file (served by the helper) or a network stream
@@ -170,7 +208,6 @@ function castCurrent(device: string | null) {
     aid: numberOrZero(() => mpv.getNumber("aid")),
   };
   sendCast();
-  core.pause(); // stop decoding locally; IINA is now the remote
 }
 
 let lastRequest: Record<string, any> | null = null;
@@ -178,7 +215,7 @@ let lastRequest: Record<string, any> | null = null;
 function sendCast() {
   if (!lastRequest) return;
   core.osd("Chromecast: connecting…");
-  setCasting(true);
+  beginCasting();
   global.postMessage("cast:load", lastRequest);
 }
 
@@ -186,7 +223,8 @@ function sendCast() {
 global.onMessage("cast:result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
   onMain(() => {
     if (!casting) return;
-    if (!r.ok) setCasting(false);
+    if (r.ok) castConfirmed = true;
+    else endCasting();
     core.osd(`Chromecast: ${r.message}`);
     if (r.needsFfmpeg) offerFfmpegInstall();
   });
@@ -210,16 +248,23 @@ function offerFfmpegInstall() {
 
 function stopCasting() {
   if (!casting) return;
-  setCasting(false);
+  endCasting();
   global.postMessage("cast:stop", {});
+  core.osd("Chromecast: stopped");
 }
 
 // Don't leave the file being served once the window that cast it is gone.
 IINAEvent.on("iina.window-will-close", stopCasting);
 
+// Pressing play/pause in IINA toggles playback on the device. The local player
+// is put straight back to paused, so nothing plays on the Mac.
 IINAEvent.on("mpv.pause.changed", () => {
   if (!casting) return;
-  global.postMessage(mpv.getFlag("pause") ? "cast:pause" : "cast:play", {});
+  if (mpv.getFlag("pause")) return; // our own pause, nothing to do
+  core.pause();
+  tvPaused = !tvPaused;
+  global.postMessage(tvPaused ? "cast:pause" : "cast:play", {});
+  core.osd(tvPaused ? "Chromecast: paused" : "Chromecast: playing");
 });
 
 IINAEvent.on("mpv.seek", () => {

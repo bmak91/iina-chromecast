@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: edded069124eda0405753656e68e09785a570f3e1deefd2fe866624786a74bb6
+# expected: 8c53616db9e7e5ae3914434396df1a3a2857bb36afeaf1c676bfd4a4d451a8f1
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -94,4 +94,5 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
 - No subtitles on the device yet.
 - Converted audio is stereo AAC. HDR video is converted without tone mapping, so
   colours can look washed out.
-- Un-pausing in IINA to resume the TV also resumes playback on the Mac.
+- While casting, IINA is the remote: the local player stays paused and muted, and
+  play/pause toggles the TV. IINA's own timeline does not follow the TV's position.

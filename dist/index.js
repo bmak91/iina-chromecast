@@ -152,19 +152,21 @@
     const root = menu.item("Chromecast", () => {
     });
     if (devices.length === 0) {
-      root.addSubMenuItem(
-        menu.item(scanned ? "No Devices Found" : "Scanning...", () => {
-        }, { enabled: false })
-      );
+      root.addSubMenuItem(disabledItem(scanned ? "No Devices Found" : "Scanning..."));
     }
     for (const d of devices) {
       root.addSubMenuItem(menu.item(d.name, () => castCurrent(d.address)));
     }
     root.addSubMenuItem(menu.separator());
-    root.addSubMenuItem(menu.item("Stop Casting", () => stopCasting(), { enabled: casting }));
+    root.addSubMenuItem(
+      casting ? menu.item("Stop Casting", () => stopCasting()) : disabledItem("Stop Casting")
+    );
     menu.removeAllItems();
     menu.addItem(root);
     menu.forceUpdate();
+  }
+  function disabledItem(title) {
+    return menu.item(title, null, { enabled: false });
   }
   function setDevices(list) {
     devices = list.filter((d) => d && typeof d.name === "string" && typeof d.address === "string").sort((a, b) => a.name.localeCompare(b.name) || a.address.localeCompare(b.address));
@@ -176,6 +178,10 @@
   }
   global.onMessage("cast:devices:list", (r) => {
     onMain(() => {
+      if (r.ok && r.casting === false && casting && castConfirmed) {
+        endCasting();
+        core.osd("Chromecast: casting ended");
+      }
       const list = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
         name: String(d.name),
         address: `${d.ip}:${d.port}`
@@ -219,9 +225,34 @@
     }, 4e3);
   });
   var casting = false;
+  var castConfirmed = false;
+  var tvPaused = false;
+  var wasMuted = false;
   function setCasting(on) {
     casting = on;
     rebuildMenu();
+  }
+  function beginCasting() {
+    if (!casting) {
+      try {
+        wasMuted = mpv.getFlag("mute");
+        mpv.set("mute", true);
+      } catch (e) {
+      }
+    }
+    castConfirmed = false;
+    tvPaused = false;
+    setCasting(true);
+    core.pause();
+  }
+  function endCasting() {
+    if (!casting) return;
+    setCasting(false);
+    castConfirmed = false;
+    try {
+      mpv.set("mute", wasMuted);
+    } catch (e) {
+    }
   }
   function currentSource(url) {
     if (typeof url !== "string" || url === "") return null;
@@ -260,19 +291,19 @@
       aid: numberOrZero(() => mpv.getNumber("aid"))
     };
     sendCast();
-    core.pause();
   }
   var lastRequest = null;
   function sendCast() {
     if (!lastRequest) return;
     core.osd("Chromecast: connecting\u2026");
-    setCasting(true);
+    beginCasting();
     global.postMessage("cast:load", lastRequest);
   }
   global.onMessage("cast:result", (r) => {
     onMain(() => {
       if (!casting) return;
-      if (!r.ok) setCasting(false);
+      if (r.ok) castConfirmed = true;
+      else endCasting();
       core.osd(`Chromecast: ${r.message}`);
       if (r.needsFfmpeg) offerFfmpegInstall();
     });
@@ -290,13 +321,18 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
   }
   function stopCasting() {
     if (!casting) return;
-    setCasting(false);
+    endCasting();
     global.postMessage("cast:stop", {});
+    core.osd("Chromecast: stopped");
   }
   IINAEvent.on("iina.window-will-close", stopCasting);
   IINAEvent.on("mpv.pause.changed", () => {
     if (!casting) return;
-    global.postMessage(mpv.getFlag("pause") ? "cast:pause" : "cast:play", {});
+    if (mpv.getFlag("pause")) return;
+    core.pause();
+    tvPaused = !tvPaused;
+    global.postMessage(tvPaused ? "cast:pause" : "cast:play", {});
+    core.osd(tvPaused ? "Chromecast: paused" : "Chromecast: playing");
   });
   IINAEvent.on("mpv.seek", () => {
     if (!casting) return;

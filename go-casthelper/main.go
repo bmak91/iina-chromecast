@@ -208,7 +208,10 @@ func (a *app) controlMux() http.Handler {
 	mux.HandleFunc("/stop", a.logged("ctrl", a.guard(http.MethodPost, a.handleStop)))
 	mux.HandleFunc("/seek", a.logged("ctrl", a.guard(http.MethodPost, a.handleSeek)))
 	mux.HandleFunc("/devices", a.logged("ctrl", a.guard(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"devices": a.discovery.list()})
+		a.mu.Lock()
+		casting := a.cast != nil
+		a.mu.Unlock()
+		writeJSON(w, map[string]any{"devices": a.discovery.list(), "casting": casting})
 	})))
 	mux.HandleFunc("/status", a.logged("ctrl", a.guard(http.MethodGet, a.handleStatus)))
 	mux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {
