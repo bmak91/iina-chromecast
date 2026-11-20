@@ -1,7 +1,7 @@
 {
   "name": "IINA Chromecast",
   "identifier": "com.dpacmittal.iina-chromecast",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chromecast support for IINA",
   "author": {
     "name": "Deepak Mittal",
@@ -12,12 +12,10 @@
   "globalEntry": "dist/global.js",
   "permissions": [
     "show-osd",
-    "show-alert",
-    "video-overlay",
     "network-request",
     "file-system"
   ],
-  "allowedDomains": ["*"],
-  "ghRepo": "dpacmittal/iina-chromecast",
-  "ghVersion": "0.1.0"
+  "allowedDomains": [
+    "127.0.0.1"
+  ]
 }

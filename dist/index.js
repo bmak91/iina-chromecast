@@ -1,2 +1,243 @@
-!function(){function e(e,t,n,r,a,i,o){try{var l=e[i](o),u=l.value}catch(e){n(e);return}l.done?t(u):Promise.resolve(u).then(r,a)}function t(t){return function(){var n=this,r=arguments;return new Promise(function(a,i){var o=t.apply(n,r);function l(t){e(o,a,i,l,u,"next",t)}function u(t){e(o,a,i,l,u,"throw",t)}l(void 0)})}}function n(e,t){var n,r,a,i={label:0,sent:function(){if(1&a[0])throw a[1];return a[1]},trys:[],ops:[]},o=Object.create(("function"==typeof Iterator?Iterator:Object).prototype),l=Object.defineProperty;return l(o,"next",{value:u(0)}),l(o,"throw",{value:u(1)}),l(o,"return",{value:u(2)}),"function"==typeof Symbol&&l(o,Symbol.iterator,{value:function(){return this}}),o;function u(l){return function(u){var s=[l,u];if(n)throw TypeError("Generator is already executing.");for(;o&&(o=0,s[0]&&(i=0)),i;)try{if(n=1,r&&(a=2&s[0]?r.return:s[0]?r.throw||((a=r.return)&&a.call(r),0):r.next)&&!(a=a.call(r,s[1])).done)return a;switch(r=0,a&&(s=[2&s[0],a.value]),s[0]){case 0:case 1:a=s;break;case 4:return i.label++,{value:s[1],done:!1};case 5:i.label++,r=s[1],s=[0];continue;case 7:s=i.ops.pop(),i.trys.pop();continue;default:if(!(a=(a=i.trys).length>0&&a[a.length-1])&&(6===s[0]||2===s[0])){i=0;continue}if(3===s[0]&&(!a||s[1]>a[0]&&s[1]<a[3])){i.label=s[1];break}if(6===s[0]&&i.label<a[1]){i.label=a[1],a=s;break}if(a&&i.label<a[2]){i.label=a[2],i.ops.push(s);break}a[2]&&i.ops.pop(),i.trys.pop();continue}s=t.call(e,i)}catch(e){s=[6,e],r=0}finally{n=a=0}if(5&s[0])throw s[1];return{value:s[0]?s[1]:void 0,done:!0}}}}var r=iina.utils,a=iina.console,i="/usr/bin/dns-sd",o=iina.utils,l=iina.http;iina.global,iina.console;var u=o.resolvePath("@data/casthelper");iina.standaloneWindow,iina.overlay,iina.sidebar;var s=iina.global,c=iina.mpv,d=iina.core,f=iina.event,v=iina.console,p=iina.menu;f.on("iina.window-loaded",function(){t(function(){return n(this,function(e){switch(e.label){case 0:if(iina.file.exists(u))return[2];return iina.core.osd("Downloading chromecast helper..."),[4,l.download("https://github.com/dpacmittal/iina-chromecast/releases/latest/download/casthelper",u)];case 1:return e.sent(),iina.core.osd("Downloading chromecast helper finished successfully"),[2]}})})()});var m=null,h=null;function b(){return t(function(){var e;return n(this,function(o){switch(o.label){case 0:return v.log("Running dynamic menu"),[4,t(function(){var e,o;return n(this,function(l){switch(l.label){case 0:return l.trys.push([0,2,,3]),[4,r.exec(i,["-t",String(3),"-Z","_googlecast._tcp","local"])];case 1:return e=function(e){var t={},n=!0,r=!1,a=void 0;try{for(var i,o=e.split("\n")[Symbol.iterator]();!(n=(i=o.next()).done);n=!0){var l=i.value,u=l.match(/^(\S+)\s+SRV\s+\d+\s+\d+\s+(\d+)\s+(\S+)/);if(u){var s=t[u[1]]||(t[u[1]]={});s.port=parseInt(u[2],10),s.hostname=u[3].replace(/\.$/,""),s.instanceName=u[1].split(RegExp("(?<!\\\\)\\."))[0].replace(/\\(\d{3})/g,function(e,t){return String.fromCharCode(parseInt(t,10))}).replace(/\\(.)/g,"$1");continue}if(u=l.match(/^(\S+)\s+TXT\s+(.*)$/)){var c=t[u[1]]||(t[u[1]]={}),d=c.txt||(c.txt={}),f=u[2].match(/"([^"]*)"/g)||[],v=!0,p=!1,m=void 0;try{for(var h,b=f[Symbol.iterator]();!(v=(h=b.next()).done);v=!0){var y=h.value.slice(1,-1),g=y.indexOf("=");-1===g?d[y]="":d[y.slice(0,g)]=y.slice(g+1)}}catch(e){p=!0,m=e}finally{try{v||null==b.return||b.return()}finally{if(p)throw m}}}}}catch(e){r=!0,a=e}finally{try{n||null==o.return||o.return()}finally{if(r)throw a}}return t}(l.sent().stdout),[3,3];case 2:return o=l.sent(),a.log(`dns-sd -Z failed: ${o}`),[2,[]];case 3:return[2,Promise.all(Object.values(e).filter(function(e){return e.hostname}).map(function(e){return t(function(){var o,l,u,s,c,d,f,v,p,m,h;return n(this,function(b){var y,g,w;switch(b.label){case 0:return l=function(e){if(void 0===e)return null;var t=parseInt(e,10);return Number.isNaN(t)?null:{videoOut:(1&t)!=0,videoIn:(2&t)!=0,audioOut:(4&t)!=0,audioIn:(8&t)!=0,raw:t}}((o=e.txt||{}).ca),s=parseInt(null!=(u=o.st)?u:"",10),h={name:o.fn||e.instanceName||e.hostname,hostname:e.hostname},[4,(y=e.hostname,t(function(){var e;return n(this,function(t){switch(t.label){case 0:return t.trys.push([0,2,,3]),[4,r.exec(i,["-t",String(3),"-G","v4",y])];case 1:return[2,function(e){var t=!0,n=!1,r=void 0;try{for(var a,i=e.split("\n")[Symbol.iterator]();!(t=(a=i.next()).done);t=!0){var o=a.value;if(/\bAdd\b/.test(o)){var l=o.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);if(l)return l[1]}}}catch(e){n=!0,r=e}finally{try{t||null==i.return||i.return()}finally{if(n)throw r}}return null}(t.sent().stdout)];case 2:return e=t.sent(),a.log(`dns-sd -G failed for ${y}: ${e}`),[2,null];case 3:return[2]}})})())];case 1:return[2,(h.ip=b.sent(),h.port=null!=(c=e.port)?c:8009,h.id=null!=(d=o.id)?d:null,h.model=null!=(f=o.md)?f:null,h.deviceType=(g=o.md,w=l,g&&/group/i.test(g)?"group":w?w.videoOut?"video":"audio":"unknown"),h.isActive=!Number.isNaN(s)&&0!==s,h.statusText=null!=(v=o.rs)?v:"",h.version=null!=(p=o.ve)?p:null,h.iconPath=null!=(m=o.ic)?m:null,h.capabilities=l,h.txt=o,h)]}})})()}))]}})})()];case 1:return(e=o.sent()).length>0?(p.removeAllItems(),p.addItem(function(e){for(var t=function(t){n.addSubMenuItem(p.item(e[t].name,function(){var n;n=e[t].ip,v.log("Casting current media to ",n),s.postMessage("cast:load",{device:n,path:d.status.url.replace("file://",""),contentType:"video/mp4",title:d.status.title||"IINA"}),d.pause()}))},n=p.item("Chromecast",function(){}),r=0;r<e.length;r++)t(r);return n}(e))):(p.removeAllItems(),p.addItem((m||(m=p.item("Chromecast",function(){})).addSubMenuItem(p.item("No Devices Found",function(){},{enabled:!1})),m))),[2]}})})()}f.on("iina.window-loaded",function(){p.removeAllItems(),p.addItem((h||(h=p.item("Chromecast",function(){})).addSubMenuItem(p.item("Scanning...",function(){},{enabled:!1})),h)),b(),setInterval(b,3e4)}),f.on("mpv.pause.changed",function(){s.postMessage(c.getFlag("pause")?"cast:pause":"cast:play",{})}),f.on("mpv.seek",function(){s.postMessage("cast:seek",{time:c.getNumber("time-pos")})})}();
-//# sourceMappingURL=index.js.map
+(() => {
+  // src/discover.ts
+  var { utils, console } = iina;
+  var DNS_SD = "/usr/bin/dns-sd";
+  var SERVICE = "_googlecast._tcp";
+  var TIMEOUT_SEC = 3;
+  var CAP = {
+    VIDEO_OUT: 1 << 0,
+    // 1
+    VIDEO_IN: 1 << 1,
+    // 2
+    AUDIO_OUT: 1 << 2,
+    // 4
+    AUDIO_IN: 1 << 3
+    // 8
+  };
+  function decodeCapabilities(ca) {
+    if (ca === void 0) return null;
+    const n = parseInt(ca, 10);
+    if (Number.isNaN(n)) return null;
+    return {
+      videoOut: (n & CAP.VIDEO_OUT) !== 0,
+      videoIn: (n & CAP.VIDEO_IN) !== 0,
+      audioOut: (n & CAP.AUDIO_OUT) !== 0,
+      audioIn: (n & CAP.AUDIO_IN) !== 0,
+      raw: n
+    };
+  }
+  function classify(md, caps) {
+    if (md && /group/i.test(md)) return "group";
+    if (caps) return caps.videoOut ? "video" : "audio";
+    return "unknown";
+  }
+  function unescapeDNSLabel(s) {
+    return s.replace(/\\(\d{3})/g, (_, d) => String.fromCharCode(parseInt(d, 10))).replace(/\\(.)/g, "$1");
+  }
+  function parseZone(stdout) {
+    const devices = {};
+    for (const line of stdout.split("\n")) {
+      let m = line.match(/^(\S+)\s+SRV\s+\d+\s+\d+\s+(\d+)\s+(\S+)/);
+      if (m) {
+        const d = devices[m[1]] || (devices[m[1]] = {});
+        d.port = parseInt(m[2], 10);
+        d.hostname = m[3].replace(/\.$/, "");
+        d.instanceName = unescapeDNSLabel(m[1].split(/(?<!\\)\./)[0]);
+        continue;
+      }
+      m = line.match(/^(\S+)\s+TXT\s+(.*)$/);
+      if (m) {
+        const d = devices[m[1]] || (devices[m[1]] = {});
+        const txt = d.txt || (d.txt = {});
+        const pairs = m[2].match(/"([^"]*)"/g) || [];
+        for (const raw of pairs) {
+          const kv = raw.slice(1, -1);
+          const eq = kv.indexOf("=");
+          if (eq === -1) {
+            txt[kv] = "";
+          } else {
+            txt[kv.slice(0, eq)] = kv.slice(eq + 1);
+          }
+        }
+      }
+    }
+    return devices;
+  }
+  function parseIP(stdout) {
+    for (const line of stdout.split("\n")) {
+      if (!/\bAdd\b/.test(line)) continue;
+      const m = line.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+  async function resolveIP(hostname) {
+    try {
+      const { stdout } = await utils.exec(DNS_SD, [
+        "-t",
+        String(TIMEOUT_SEC),
+        "-G",
+        "v4",
+        hostname
+      ]);
+      return parseIP(stdout);
+    } catch (e) {
+      console.log(`dns-sd -G failed for ${hostname}: ${e}`);
+      return null;
+    }
+  }
+  async function discoverChromecasts() {
+    let zone;
+    try {
+      const { stdout } = await utils.exec(DNS_SD, [
+        "-t",
+        String(TIMEOUT_SEC),
+        "-Z",
+        SERVICE,
+        "local"
+      ]);
+      zone = parseZone(stdout);
+    } catch (e) {
+      console.log(`dns-sd -Z failed: ${e}`);
+      return [];
+    }
+    const entries = Object.values(zone).filter((d) => d.hostname);
+    return Promise.all(
+      entries.map(async (d) => {
+        var _a, _b, _c, _d, _e, _f, _g;
+        const txt = d.txt || {};
+        const caps = decodeCapabilities(txt["ca"]);
+        const st = parseInt((_a = txt["st"]) != null ? _a : "", 10);
+        return {
+          name: txt["fn"] || d.instanceName || d.hostname,
+          hostname: d.hostname,
+          ip: await resolveIP(d.hostname),
+          port: (_b = d.port) != null ? _b : 8009,
+          id: (_c = txt["id"]) != null ? _c : null,
+          model: (_d = txt["md"]) != null ? _d : null,
+          deviceType: classify(txt["md"], caps),
+          isActive: !Number.isNaN(st) && st !== 0,
+          statusText: (_e = txt["rs"]) != null ? _e : "",
+          version: (_f = txt["ve"]) != null ? _f : null,
+          iconPath: (_g = txt["ic"]) != null ? _g : null,
+          capabilities: caps,
+          txt
+          // raw map: anything not modeled above is still here
+        };
+      })
+    );
+  }
+
+  // src/index.ts
+  var {
+    standaloneWindow,
+    overlay,
+    sidebar,
+    global,
+    mpv,
+    core,
+    event: IINAEvent,
+    console: IINAConsole,
+    menu
+  } = iina;
+  IINAConsole.log("Plugin is running");
+  var noDevicesFoundMenuItem = null;
+  var scanningMenuItem = null;
+  function noDevicesFoundMenu() {
+    if (noDevicesFoundMenuItem) return noDevicesFoundMenuItem;
+    noDevicesFoundMenuItem = menu.item("Chromecast", () => {
+    });
+    noDevicesFoundMenuItem.addSubMenuItem(
+      menu.item("No Devices Found", () => {
+      }, {
+        enabled: false
+      })
+    );
+    return noDevicesFoundMenuItem;
+  }
+  function scanningMenu() {
+    if (scanningMenuItem) return scanningMenuItem;
+    scanningMenuItem = menu.item("Chromecast", () => {
+    });
+    scanningMenuItem.addSubMenuItem(
+      menu.item("Scanning...", () => {
+      }, {
+        enabled: false
+      })
+    );
+    return scanningMenuItem;
+  }
+  function devicesMenu(devices) {
+    let devicesMenuItem = menu.item("Chromecast", () => {
+    });
+    for (let i = 0; i < devices.length; i++) {
+      devicesMenuItem.addSubMenuItem(
+        menu.item(devices[i].name, () => {
+          castCurrent(devices[i].ip);
+        })
+      );
+    }
+    devicesMenuItem.addSubMenuItem(menu.separator());
+    devicesMenuItem.addSubMenuItem(menu.item("Stop Casting", () => stopCasting()));
+    return devicesMenuItem;
+  }
+  IINAEvent.on("iina.window-loaded", () => {
+    menu.removeAllItems();
+    menu.addItem(scanningMenu());
+    dynamicMenu();
+    setInterval(dynamicMenu, 3e4);
+  });
+  async function dynamicMenu() {
+    IINAConsole.log("Running dynamic menu");
+    const devices = await discoverChromecasts();
+    if (devices.length > 0) {
+      menu.removeAllItems();
+      menu.addItem(devicesMenu(devices));
+    } else {
+      menu.removeAllItems();
+      menu.addItem(noDevicesFoundMenu());
+    }
+  }
+  var casting = false;
+  function localPath(url) {
+    if (!url) return null;
+    if (url.startsWith("file://")) {
+      try {
+        return decodeURIComponent(url.slice("file://".length));
+      } catch (e) {
+        return null;
+      }
+    }
+    return url.startsWith("/") ? url : null;
+  }
+  function castCurrent(device) {
+    const path = localPath(core.status.url);
+    if (!device || !path) {
+      core.osd(device ? "Only local files can be cast" : "Device address not found");
+      return;
+    }
+    IINAConsole.log("Casting current media to ", device);
+    global.postMessage("cast:load", {
+      device,
+      path,
+      contentType: "video/mp4",
+      title: core.status.title || "IINA"
+    });
+    casting = true;
+    core.pause();
+  }
+  function stopCasting() {
+    if (!casting) return;
+    casting = false;
+    global.postMessage("cast:stop", {});
+  }
+  IINAEvent.on("iina.window-will-close", stopCasting);
+  IINAEvent.on("mpv.pause.changed", () => {
+    if (!casting) return;
+    global.postMessage(mpv.getFlag("pause") ? "cast:pause" : "cast:play", {});
+  });
+  IINAEvent.on("mpv.seek", () => {
+    if (!casting) return;
+    global.postMessage("cast:seek", { time: mpv.getNumber("time-pos") });
+  });
+})();

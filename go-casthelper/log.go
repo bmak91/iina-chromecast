@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 )
@@ -41,7 +40,7 @@ func setupLogging(path string, level int) {
 
 	w := io.Writer(os.Stderr)
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			logger.Printf("[ERROR] cannot open log file %s: %v (stderr only)", path, err)
 		} else {
@@ -54,10 +53,6 @@ func setupLogging(path string, level int) {
 	// same place.
 	log.SetOutput(w)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-}
-
-func defaultLogPath() string {
-	return filepath.Join(os.TempDir(), "casthelper.log")
 }
 
 func logAt(level int, format string, args ...any) {

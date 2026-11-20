@@ -1,5 +1,4 @@
 import { discoverChromecasts, DiscoverResult } from "./discover";
-import { downloadCastHelper } from "./download-helper";
 
 const {
   standaloneWindow,
@@ -14,10 +13,6 @@ const {
 } = iina;
 
 IINAConsole.log("Plugin is running");
-
-IINAEvent.on("iina.window-loaded", () => {
-  downloadCastHelper();
-});
 
 let noDevicesFoundMenuItem: IINA.MenuItem = null;
 let scanningMenuItem: IINA.MenuItem = null;
@@ -53,6 +48,8 @@ function devicesMenu(devices: DiscoverResult[]) {
       })
     );
   }
+  devicesMenuItem.addSubMenuItem(menu.separator());
+  devicesMenuItem.addSubMenuItem(menu.item("Stop Casting", () => stopCasting()));
   return devicesMenuItem;
 }
 
@@ -78,21 +75,53 @@ async function dynamicMenu() {
   }
 }
 
-function castCurrent(device) {
+let casting = false;
+
+// Only local files can be cast: the helper serves the file itself.
+function localPath(url: string | undefined): string | null {
+  if (!url) return null;
+  if (url.startsWith("file://")) {
+    try {
+      return decodeURIComponent(url.slice("file://".length));
+    } catch (e) {
+      return null;
+    }
+  }
+  return url.startsWith("/") ? url : null;
+}
+
+function castCurrent(device: string | null) {
+  const path = localPath(core.status.url);
+  if (!device || !path) {
+    core.osd(device ? "Only local files can be cast" : "Device address not found");
+    return;
+  }
   IINAConsole.log("Casting current media to ", device);
   global.postMessage("cast:load", {
     device,
-    path: core.status.url.replace("file://", ""),
+    path,
     contentType: "video/mp4",
     title: core.status.title || "IINA",
   });
+  casting = true;
   core.pause(); // stop decoding locally; IINA is now the remote
 }
 
+function stopCasting() {
+  if (!casting) return;
+  casting = false;
+  global.postMessage("cast:stop", {});
+}
+
+// Don't leave the file being served once the window that cast it is gone.
+IINAEvent.on("iina.window-will-close", stopCasting);
+
 IINAEvent.on("mpv.pause.changed", () => {
+  if (!casting) return;
   global.postMessage(mpv.getFlag("pause") ? "cast:pause" : "cast:play", {});
 });
 
 IINAEvent.on("mpv.seek", () => {
+  if (!casting) return;
   global.postMessage("cast:seek", { time: mpv.getNumber("time-pos") });
 });

@@ -2,15 +2,22 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,85 +25,95 @@ import (
 )
 
 // app holds everything the two HTTP servers share.
+//
+// Security model:
+//   - The control API listens on loopback only and every request must carry
+//     the random token printed on stdout at startup (X-Cast-Token). Requests
+//     with an Origin header or an unexpected Host header are refused, so a web
+//     page (CSRF, DNS rebinding) cannot drive the helper.
+//   - The media server only exists while a cast session is active, is bound to
+//     the one local address that reaches the device, serves exactly one file
+//     under an unguessable per-session path, and only answers the device's IP.
 type app struct {
-	mu           sync.Mutex
-	file         string    // absolute path of the file currently being served
-	contentType  string    // content type advertised to the device in LOAD
-	cast         *castConn // active connection, or nil
-	mediaURLBase string    // e.g. http://192.168.1.20:8010
+	mu          sync.Mutex
+	file        string       // resolved absolute path of the file being served
+	contentType string       // content type advertised to the device in LOAD
+	mediaToken  string       // random path component for the current session
+	deviceIP    netip.Addr   // the only address allowed to fetch the media
+	cast        *castConn    // active connection, or nil
+	mediaSrv    *http.Server // running only while a session is active
 
-	mediaHits atomic.Uint64 // how many times the device has fetched /media
+	token       string // control API secret
+	controlAddr string // host:port the control API listens on
+	mediaPort   string // port the media server binds to
+	mediaBindIP string // optional override for the media bind/advertise address
+
+	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
 }
 
+// allowLoopbackDevice lets tests cast to a fake device on 127.0.0.1.
+var allowLoopbackDevice = false
+
+// Containers the Default Media Receiver can plausibly play. Anything else is
+// refused, so the helper can never be talked into serving arbitrary files.
+var mediaExtensions = map[string]bool{
+	".mp4": true, ".m4v": true, ".mov": true, ".webm": true, ".mkv": true,
+	".mp3": true, ".m4a": true, ".aac": true, ".ogg": true, ".oga": true,
+	".opus": true, ".flac": true, ".wav": true,
+}
+
+var contentTypeRE = regexp.MustCompile(`^(video|audio)/[A-Za-z0-9.+-]{1,64}$`)
+
 func main() {
-	controlAddr := flag.String("control", "127.0.0.1:9092", "localhost control API address (for the IINA plugin)")
-	mediaAddr := flag.String("media", "0.0.0.0:8010", "media server bind address (must be reachable by the Chromecast)")
-	advertiseIP := flag.String("ip", "", "LAN IP to advertise to the device (default: autodetect)")
-	verbosity := flag.Int("v", lvlDebug, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
-	logPath := flag.String("log", defaultLogPath(), "append logs to this file as well as stderr (empty to disable)")
+	controlAddr := flag.String("control", "127.0.0.1:9092", "loopback control API address (for the IINA plugin)")
+	mediaAddr := flag.String("media", ":8010", "media server port; a specific host part overrides the autodetected bind address")
+	advertiseIP := flag.String("ip", "", "LAN IP to bind and advertise to the device (default: the address that reaches the device)")
+	verbosity := flag.Int("v", lvlInfo, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
+	logPath := flag.String("log", "", "also append logs to this file (created 0600; default: stderr only)")
 	flag.Parse()
 
 	setupLogging(*logPath, *verbosity)
+	logInfo("=== casthelper starting: pid=%d ===", os.Getpid())
 
-	logInfo("=== casthelper starting: pid=%d args=%v ===", os.Getpid(), os.Args[1:])
-	logInfo("flags: control=%s media=%s ip=%q verbosity=%d log=%s", *controlAddr, *mediaAddr, *advertiseIP, *verbosity, *logPath)
-	logInterfaces()
-
-	ip := *advertiseIP
-	if ip == "" {
-		ip = detectLANIP()
-		logInfo("autodetected LAN IP: %s", ip)
-	} else {
-		logInfo("using LAN IP from -ip flag: %s", ip)
+	ctrlHost, _, err := net.SplitHostPort(*controlAddr)
+	if err != nil {
+		logError("cannot parse -control address %q: %v", *controlAddr, err)
+		os.Exit(1)
 	}
-	if ip == "127.0.0.1" || ip == "" {
-		logWarn("advertising %q to the device — a Chromecast cannot reach this address; "+
-			"pass -ip <your LAN IP> if autodetection picked the wrong interface", ip)
+	if ip, err := netip.ParseAddr(ctrlHost); err != nil || !ip.IsLoopback() {
+		logError("-control must be a loopback IP address, got %q", ctrlHost)
+		os.Exit(1)
 	}
 
-	_, mediaPort, err := net.SplitHostPort(*mediaAddr)
+	mediaHost, mediaPort, err := net.SplitHostPort(*mediaAddr)
 	if err != nil {
 		logError("cannot parse -media address %q: %v", *mediaAddr, err)
 		os.Exit(1)
 	}
-
-	a := &app{mediaURLBase: fmt.Sprintf("http://%s:%s", ip, mediaPort)}
-	logInfo("media URL advertised to devices: %s/media", a.mediaURLBase)
-
-	// Media server: serves the current file to the Chromecast. http.ServeContent
-	// (via ServeFile) honors Range requests automatically, so seeking works.
-	mediaMux := http.NewServeMux()
-	mediaMux.HandleFunc("/media", a.logged("media", a.handleMedia))
-	mediaMux.HandleFunc("/", a.logged("media", func(w http.ResponseWriter, r *http.Request) {
-		logWarn("media server: unexpected path %s requested by %s", r.URL.Path, r.RemoteAddr)
-		http.NotFound(w, r)
-	}))
-	mediaLn, err := net.Listen("tcp", *mediaAddr)
-	if err != nil {
-		logError("media server cannot bind %s: %v", *mediaAddr, err)
-		os.Exit(1)
+	bindIP := *advertiseIP
+	if bindIP == "" && mediaHost != "" && mediaHost != "0.0.0.0" && mediaHost != "::" {
+		bindIP = mediaHost
 	}
-	logInfo("media server listening on %s", mediaLn.Addr())
-	go func() {
-		if err := http.Serve(mediaLn, mediaMux); err != nil {
-			logError("media server stopped: %v", err)
+	if bindIP != "" {
+		if _, err := netip.ParseAddr(bindIP); err != nil {
+			logError("media bind address %q is not an IP address", bindIP)
 			os.Exit(1)
 		}
-	}()
+	}
 
-	// Control API: driven by the IINA plugin over localhost.
-	ctrlMux := http.NewServeMux()
-	ctrlMux.HandleFunc("/cast", a.logged("ctrl", a.handleCast))
-	ctrlMux.HandleFunc("/play", a.logged("ctrl", a.simpleCmd("PLAY", func(c *castConn) error { return c.play() })))
-	ctrlMux.HandleFunc("/pause", a.logged("ctrl", a.simpleCmd("PAUSE", func(c *castConn) error { return c.pause() })))
-	ctrlMux.HandleFunc("/stop", a.logged("ctrl", a.handleStop))
-	ctrlMux.HandleFunc("/seek", a.logged("ctrl", a.handleSeek))
-	ctrlMux.HandleFunc("/status", a.logged("ctrl", a.handleStatus))
-	ctrlMux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {
-		logWarn("control API: unknown endpoint %s %s", r.Method, r.URL.Path)
-		http.NotFound(w, r)
-	}))
+	token, err := randomToken()
+	if err != nil {
+		logError("cannot generate control token: %v", err)
+		os.Exit(1)
+	}
+
+	a := &app{
+		token:       token,
+		controlAddr: *controlAddr,
+		mediaPort:   mediaPort,
+		mediaBindIP: bindIP,
+	}
 
 	ctrlLn, err := net.Listen("tcp", *controlAddr)
 	if err != nil {
@@ -104,29 +121,98 @@ func main() {
 		os.Exit(1)
 	}
 	logInfo("control API listening on %s", ctrlLn.Addr())
+	ctrlSrv := &http.Server{
+		Handler:           a.controlMux(),
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() {
-		if err := http.Serve(ctrlLn, ctrlMux); err != nil {
+		if err := ctrlSrv.Serve(ctrlLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logError("control server stopped: %v", err)
 			os.Exit(1)
 		}
 	}()
 
-	// Signal the plugin (which reads our stdout) that we're up.
-	fmt.Println("READY")
+	// Signal the plugin (which reads our stdout) that we're up, and hand it the
+	// secret it must present on every control request.
+	fmt.Printf("READY %s\n", token)
 	logInfo("wrote READY to stdout; waiting for control requests")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go watchParent(sig)
 	s := <-sig
 	logInfo("received signal %s, shutting down", s)
-	a.mu.Lock()
-	if a.cast != nil {
-		logInfo("tearing down active cast session")
-		a.cast.stopReceiver()
-		a.cast.Close()
-	}
-	a.mu.Unlock()
+	a.stopSession(true)
 	logInfo("=== casthelper exiting ===")
+}
+
+// watchParent shuts the helper down when the process that started it (IINA)
+// goes away, so no listener outlives the player.
+func watchParent(sig chan<- os.Signal) {
+	parent := os.Getppid()
+	if parent <= 1 {
+		return
+	}
+	for range time.Tick(2 * time.Second) {
+		if os.Getppid() != parent {
+			logInfo("parent process %d is gone", parent)
+			sig <- syscall.SIGTERM
+			return
+		}
+	}
+}
+
+func randomToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (a *app) controlMux() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cast", a.logged("ctrl", a.guard(http.MethodPost, a.handleCast)))
+	mux.HandleFunc("/play", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PLAY", func(c *castConn) error { return c.play() }))))
+	mux.HandleFunc("/pause", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PAUSE", func(c *castConn) error { return c.pause() }))))
+	mux.HandleFunc("/stop", a.logged("ctrl", a.guard(http.MethodPost, a.handleStop)))
+	mux.HandleFunc("/seek", a.logged("ctrl", a.guard(http.MethodPost, a.handleSeek)))
+	mux.HandleFunc("/status", a.logged("ctrl", a.guard(http.MethodGet, a.handleStatus)))
+	mux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	return mux
+}
+
+// guard rejects anything that is not the IINA plugin: wrong Host (DNS
+// rebinding), any Origin (a browser page), wrong method, or a missing/wrong
+// token.
+func (a *app) guard(method string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != a.controlAddr {
+			logWarn("control API: refused request with Host %q", r.Host)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Origin") != "" {
+			logWarn("control API: refused browser request from Origin %q", r.Header.Get("Origin"))
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method != method {
+			w.Header().Set("Allow", method)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		got := r.Header.Get("X-Cast-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
+			logWarn("control API: refused request without a valid token from %s", r.RemoteAddr)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
 }
 
 // respRecorder captures what a handler actually replied so it can be logged.
@@ -158,17 +244,18 @@ func (r *respRecorder) Write(b []byte) (int, error) {
 }
 
 // logged wraps a handler with request/response logging. Every request gets a
-// sequence number so its log lines can be matched up.
+// sequence number so its log lines can be matched up. The request path is not
+// logged for media requests because it contains the session token.
 func (a *app) logged(kind string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := a.reqSeq.Add(1)
 		start := time.Now()
 
-		logInfo("[%s#%d] --> %s %s from %s", kind, id, r.Method, r.URL.RequestURI(), r.RemoteAddr)
-		if rng := r.Header.Get("Range"); rng != "" {
-			logInfo("[%s#%d]     Range: %s  User-Agent: %s", kind, id, rng, r.Header.Get("User-Agent"))
+		shown := r.URL.Path
+		if kind == "media" {
+			shown = "/media/…"
 		}
-		logTrace("[%s#%d]     headers: %v", kind, id, r.Header)
+		logDebug("[%s#%d] --> %s %s from %s", kind, id, r.Method, shown, r.RemoteAddr)
 
 		rec := &respRecorder{ResponseWriter: w, record: kind == "ctrl"}
 		h(rec, r)
@@ -176,39 +263,52 @@ func (a *app) logged(kind string, h http.HandlerFunc) http.HandlerFunc {
 		if rec.status == 0 {
 			rec.status = http.StatusOK
 		}
-		body := ""
-		if rec.record && rec.body.Len() > 0 {
-			body = " body=" + truncate(rec.body.String(), 400)
-		}
-		logInfo("[%s#%d] <-- %d (%d bytes) in %s%s", kind, id, rec.status, rec.n, time.Since(start).Round(time.Millisecond), body)
+		logDebug("[%s#%d] <-- %d (%d bytes) in %s", kind, id, rec.status, rec.n, time.Since(start).Round(time.Millisecond))
 	}
 }
 
 func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
-	path, ct := a.file, a.contentType
+	path, ct, token, device := a.file, a.contentType, a.mediaToken, a.deviceIP
 	a.mu.Unlock()
 
-	hits := a.mediaHits.Add(1)
-	logInfo("media: request #%d for %q (content-type %q) from %s", hits, path, ct, r.RemoteAddr)
-
-	if path == "" {
-		logError("media: no file loaded yet — the device asked for /media before /cast set a file")
-		http.Error(w, "no file loaded", http.StatusNotFound)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if st, err := os.Stat(path); err != nil {
-		logError("media: cannot stat %q: %v — the device will get an error response", path, err)
-	} else {
-		logDebug("media: serving %q (%d bytes, mode %s)", path, st.Size(), st.Mode())
+	got := strings.TrimPrefix(r.URL.Path, "/media/")
+	if path == "" || token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	remote, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil || remote.Addr().Unmap() != device {
+		logWarn("media: refused request from %s (only %s may fetch)", r.RemoteAddr, device)
+		http.NotFound(w, r)
+		return
 	}
 
-	if ct != "" {
-		w.Header().Set("Content-Type", ct)
+	f, err := os.Open(path)
+	if err != nil {
+		logError("media: cannot open %q: %v", path, err)
+		http.NotFound(w, r)
+		return
 	}
-	// ServeFile adds Accept-Ranges and answers 206 Partial Content for range
-	// requests, which is what lets the device seek.
-	http.ServeFile(w, r, path)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		logError("media: %q is no longer a regular file", path)
+		http.NotFound(w, r)
+		return
+	}
+
+	hits := a.mediaHits.Add(1)
+	logDebug("media: request #%d from %s (Range %q)", hits, r.RemoteAddr, r.Header.Get("Range"))
+
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// ServeContent honors Range requests, which is what lets the device seek.
+	http.ServeContent(w, r, "", st.ModTime(), f)
 }
 
 type castRequest struct {
@@ -218,114 +318,194 @@ type castRequest struct {
 	Title       string `json:"title"`
 }
 
-func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+// parseDevice accepts only a literal private/link-local IP (optionally with a
+// port), so the helper cannot be pointed at arbitrary hosts.
+func parseDevice(s string) (netip.AddrPort, error) {
+	ap, err := netip.ParseAddrPort(s)
 	if err != nil {
-		logError("cast: cannot read request body: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		ip, err2 := netip.ParseAddr(s)
+		if err2 != nil {
+			return netip.AddrPort{}, fmt.Errorf("device must be an IP address or IP:port")
+		}
+		ap = netip.AddrPortFrom(ip, 8009)
 	}
-	logInfo("cast: raw request body (%d bytes): %s", len(raw), truncate(string(raw), 1000))
-	if len(raw) == 0 {
-		logError("cast: empty request body — the plugin sent no JSON payload")
-		http.Error(w, "empty request body", http.StatusBadRequest)
-		return
+	ip := ap.Addr().Unmap()
+	ok := ip.IsPrivate() || ip.IsLinkLocalUnicast() || (allowLoopbackDevice && ip.IsLoopback())
+	if !ok {
+		return netip.AddrPort{}, fmt.Errorf("device %s is not on the local network", ip)
 	}
+	if ap.Port() == 0 {
+		return netip.AddrPort{}, fmt.Errorf("device port must not be 0")
+	}
+	return netip.AddrPortFrom(ip, ap.Port()), nil
+}
 
+// resolveMediaPath returns the real path of a regular media file, or an error.
+func resolveMediaPath(p string) (string, error) {
+	if !filepath.IsAbs(p) {
+		return "", errors.New("path must be absolute")
+	}
+	real, err := filepath.EvalSymlinks(filepath.Clean(p))
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve path: %w", err)
+	}
+	st, err := os.Stat(real)
+	if err != nil {
+		return "", fmt.Errorf("cannot stat file: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return "", errors.New("path is not a regular file")
+	}
+	if !mediaExtensions[strings.ToLower(filepath.Ext(real))] {
+		return "", fmt.Errorf("%q is not a supported media file type", filepath.Ext(real))
+	}
+	return real, nil
+}
+
+func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	if err != nil {
+		http.Error(w, "cannot read request body", http.StatusBadRequest)
+		return
+	}
 	var req castRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		logError("cast: cannot decode JSON body: %v (body was: %s)", err, truncate(string(raw), 500))
+		logError("cast: cannot decode JSON body: %v", err)
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	device, err := parseDevice(req.Device)
+	if err != nil {
+		logError("cast: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	logInfo("cast: parsed device=%q path=%q contentType=%q title=%q", req.Device, req.Path, req.ContentType, req.Title)
-
-	if req.Device == "" || req.Path == "" {
-		logError("cast: missing required field(s): device=%q path=%q", req.Device, req.Path)
-		http.Error(w, "device and path are required", http.StatusBadRequest)
+	path, err := resolveMediaPath(req.Path)
+	if err != nil {
+		logError("cast: rejected path: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-	if _, _, err := net.SplitHostPort(req.Device); err != nil {
-		logDebug("cast: device %q has no port (%v), defaulting to 8009", req.Device, err)
-		req.Device = net.JoinHostPort(req.Device, "8009")
 	}
 	if req.ContentType == "" {
 		req.ContentType = "video/mp4"
-		logDebug("cast: no contentType given, defaulting to %s", req.ContentType)
 	}
+	if !contentTypeRE.MatchString(req.ContentType) {
+		http.Error(w, "contentType must be video/* or audio/*", http.StatusBadRequest)
+		return
+	}
+	if len(req.Title) > 512 {
+		req.Title = req.Title[:512]
+	}
+	logMediaTypeHint(path, req.ContentType)
 
-	// The device will fetch this file over HTTP; if we cannot read it, nothing
-	// downstream can work.
-	if !filepath.IsAbs(req.Path) {
-		logWarn("cast: path %q is not absolute — it resolves against the helper's cwd, not IINA's", req.Path)
-	}
-	if st, err := os.Stat(req.Path); err != nil {
-		logError("cast: file %q is not readable: %v", req.Path, err)
-	} else {
-		logInfo("cast: file %q ok (%d bytes, mode %s, ext %q)", req.Path, st.Size(), st.Mode(), filepath.Ext(req.Path))
-		if f, err := os.Open(req.Path); err != nil {
-			logError("cast: file %q stat'd but cannot be opened: %v", req.Path, err)
-		} else {
-			f.Close()
-		}
-	}
-	logMediaTypeHint(req.Path, req.ContentType)
+	// One session at a time: drop whatever was being served before.
+	a.stopSession(false)
 
-	a.mu.Lock()
-	a.file = req.Path
-	a.contentType = req.ContentType
-	if a.cast != nil {
-		logInfo("cast: closing previous cast connection")
-		a.cast.Close()
-		a.cast = nil
-	}
-	base := a.mediaURLBase
-	a.mu.Unlock()
-
-	logInfo("cast: dialing device %s ...", req.Device)
-	dialStart := time.Now()
-	conn, err := dialCast(req.Device)
+	logInfo("cast: dialing device %s ...", device)
+	conn, err := dialCast(device.String())
 	if err != nil {
-		logError("cast: dial %s failed after %s: %v", req.Device, time.Since(dialStart).Round(time.Millisecond), err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		logError("cast: dial %s failed: %v", device, err)
+		http.Error(w, "cannot connect to device", http.StatusBadGateway)
 		return
 	}
-	logInfo("cast: connected to %s in %s", req.Device, time.Since(dialStart).Round(time.Millisecond))
 
-	mediaURL := base + "/media"
-	logInfo("cast: launching receiver and loading %s", mediaURL)
-	loadStart := time.Now()
-	if err := conn.launchAndLoad(mediaURL, req.ContentType, req.Title); err != nil {
-		logError("cast: launchAndLoad failed after %s: %v", time.Since(loadStart).Round(time.Millisecond), err)
+	bindIP := a.mediaBindIP
+	if bindIP == "" {
+		bindIP = conn.localIP
+	}
+	mediaToken, err := randomToken()
+	if err != nil {
 		conn.Close()
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "cannot generate session token", http.StatusInternalServerError)
 		return
 	}
-	logInfo("cast: LOAD accepted in %s", time.Since(loadStart).Round(time.Millisecond))
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindIP, a.mediaPort))
+	if err != nil {
+		logError("cast: media server cannot bind %s:%s: %v", bindIP, a.mediaPort, err)
+		conn.Close()
+		http.Error(w, "cannot start media server", http.StatusInternalServerError)
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/media/", a.logged("media", a.handleMedia))
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 16 << 10}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logError("media server stopped: %v", err)
+		}
+	}()
+	logInfo("media server listening on %s for device %s only", ln.Addr(), device.Addr())
 
 	a.mu.Lock()
-	a.cast = conn
+	a.file, a.contentType = path, req.ContentType
+	a.mediaToken, a.deviceIP = mediaToken, device.Addr()
+	a.cast, a.mediaSrv = conn, srv
 	a.mu.Unlock()
+	conn.setOnClose(func() { a.endSession(conn) })
 
-	a.watchForMediaFetch(mediaURL)
+	mediaURL := fmt.Sprintf("http://%s/media/%s", net.JoinHostPort(bindIP, a.mediaPort), mediaToken)
+	if err := conn.launchAndLoad(mediaURL, req.ContentType, req.Title); err != nil {
+		logError("cast: launchAndLoad failed: %v", err)
+		a.endSession(conn)
+		conn.Close()
+		http.Error(w, "device refused the media", http.StatusBadGateway)
+		return
+	}
+	logInfo("cast: LOAD accepted")
+	a.watchForMediaFetch()
 
-	writeJSON(w, map[string]any{"ok": true, "mediaUrl": mediaURL})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// endSession stops serving media if conn is still the active session.
+func (a *app) endSession(conn *castConn) {
+	a.mu.Lock()
+	if a.cast != conn {
+		a.mu.Unlock()
+		return
+	}
+	srv := a.mediaSrv
+	a.cast, a.mediaSrv = nil, nil
+	a.file, a.contentType, a.mediaToken = "", "", ""
+	a.deviceIP = netip.Addr{}
+	a.mu.Unlock()
+	if srv != nil {
+		srv.Close()
+		logInfo("media server stopped")
+	}
+}
+
+// stopSession ends the active session, if any. With stopDevice set it also
+// asks the device to stop playback and quit the receiver app.
+func (a *app) stopSession(stopDevice bool) bool {
+	a.mu.Lock()
+	conn := a.cast
+	a.mu.Unlock()
+	if conn == nil {
+		return false
+	}
+	if stopDevice {
+		if err := conn.stop(); err != nil {
+			logWarn("stop: STOP command failed (continuing teardown): %v", err)
+		}
+		conn.stopReceiver()
+	}
+	a.endSession(conn)
+	conn.Close()
+	return true
 }
 
 // watchForMediaFetch flags the most common failure mode: the device accepts the
-// LOAD but never connects back to our media server (wrong advertised IP,
-// firewall, or a different subnet).
-func (a *app) watchForMediaFetch(mediaURL string) {
+// LOAD but never connects back to our media server (firewall, or a different
+// subnet).
+func (a *app) watchForMediaFetch() {
 	before := a.mediaHits.Load()
 	go func() {
 		time.Sleep(15 * time.Second)
 		if a.mediaHits.Load() == before {
-			logWarn("diagnostic: 15s after LOAD the device has still not requested %s — "+
-				"it probably cannot reach us. Check that the advertised IP is on the same "+
-				"subnet as the device and that the local firewall allows inbound connections "+
-				"to the media port.", mediaURL)
-		} else {
-			logInfo("diagnostic: device fetched the media URL, byte streaming is underway")
+			logWarn("diagnostic: 15s after LOAD the device has still not requested the media — " +
+				"check that the macOS firewall allows inbound connections to casthelper.")
 		}
 	}()
 }
@@ -336,83 +516,59 @@ func (a *app) simpleCmd(name string, fn func(*castConn) error) http.HandlerFunc 
 		conn := a.cast
 		a.mu.Unlock()
 		if conn == nil {
-			logWarn("%s: no active cast connection (was /cast ever called, or did it fail?)", name)
 			http.Error(w, "not casting", http.StatusConflict)
 			return
 		}
-		logInfo("%s: sending command", name)
 		if err := fn(conn); err != nil {
 			logError("%s: command failed: %v", name, err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, "command failed", http.StatusBadGateway)
 			return
 		}
-		logInfo("%s: command acknowledged", name)
 		writeJSON(w, map[string]any{"ok": true})
 	}
 }
 
 func (a *app) handleSeek(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<12))
 	if err != nil {
-		logError("seek: cannot read body: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "cannot read request body", http.StatusBadRequest)
 		return
 	}
-	logInfo("seek: raw body: %s", truncate(string(raw), 300))
-
 	var body struct {
 		Time float64 `json:"time"`
 	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		logError("seek: cannot decode body: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(raw, &body); err != nil || body.Time < 0 {
+		http.Error(w, "invalid seek body", http.StatusBadRequest)
 		return
 	}
-	logInfo("seek: to %.3fs", body.Time)
 	a.simpleCmd("SEEK", func(c *castConn) error { return c.seek(body.Time) })(w, r)
 }
 
 func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	conn := a.cast
-	a.cast = nil
-	a.mu.Unlock()
-	if conn != nil {
-		logInfo("stop: stopping media, receiver, and closing connection")
-		if err := conn.stop(); err != nil {
-			logWarn("stop: STOP command failed (continuing teardown): %v", err)
-		}
-		conn.stopReceiver()
-		conn.Close()
-	} else {
+	if !a.stopSession(true) {
 		logWarn("stop: no active cast connection")
 	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// handleStatus dumps the helper's view of the world — handy when the plugin
+// handleStatus reports whether a session is active — handy when the plugin
 // looks connected but nothing is playing.
 func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
-	file, ct, conn, base := a.file, a.contentType, a.cast, a.mediaURLBase
+	ct, conn := a.contentType, a.cast
 	a.mu.Unlock()
 
 	st := map[string]any{
-		"file":         file,
-		"contentType":  ct,
-		"mediaURLBase": base,
-		"casting":      conn != nil,
-		"mediaHits":    a.mediaHits.Load(),
+		"contentType": ct,
+		"casting":     conn != nil,
+		"mediaHits":   a.mediaHits.Load(),
 	}
 	if conn != nil {
 		conn.sessMu.Lock()
-		st["transportId"] = conn.transportID
-		st["mediaSessionId"] = conn.mediaSessionID
 		st["playerState"] = conn.playerState
 		st["idleReason"] = conn.idleReason
 		conn.sessMu.Unlock()
 	}
-	logInfo("status: %+v", st)
 	writeJSON(w, st)
 }
 
@@ -426,53 +582,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 // logMediaTypeHint warns about combinations the Default Media Receiver is known
 // to reject outright, which looks like "casting silently does nothing".
 func logMediaTypeHint(path, contentType string) {
-	ext := filepath.Ext(path)
-	switch ext {
-	case ".mkv", ".avi", ".wmv", ".flv", ".ts", ".m2ts":
-		logWarn("media type: %s is not supported by the Default Media Receiver (CC1AD845); "+
-			"the device will accept LOAD and then go IDLE with idleReason=ERROR. "+
-			"Only MP4/WebM containers with H.264/VP8 video and AAC/Vorbis audio play reliably.", ext)
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".mkv" {
+		logWarn("media type: %s often fails on the Default Media Receiver; "+
+			"MP4/WebM with H.264/VP8 video and AAC/Vorbis audio play reliably.", ext)
 	}
 	if ext == ".mp4" && contentType != "video/mp4" {
 		logWarn("media type: %s is advertised as %q; a mismatched content type makes the receiver refuse the stream", ext, contentType)
-	}
-}
-
-// detectLANIP finds the outbound LAN address without sending any packets
-// (UDP "connect" just picks the route).
-func detectLANIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		logError("detectLANIP: cannot determine outbound address: %v (falling back to 127.0.0.1)", err)
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-	ip := conn.LocalAddr().(*net.UDPAddr).IP.String()
-	logDebug("detectLANIP: outbound route to 8.8.8.8:80 uses local address %s", ip)
-	return ip
-}
-
-// logInterfaces prints every usable local address, so a wrong -ip guess is
-// obvious from the log alone.
-func logInterfaces() {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		logError("cannot enumerate network interfaces: %v", err)
-		return
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			logWarn("cannot list addresses for %s: %v", iface.Name, err)
-			continue
-		}
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				logInfo("interface %s: %s", iface.Name, ipnet.String())
-			}
-		}
 	}
 }

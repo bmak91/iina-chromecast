@@ -1,13 +1,11 @@
 {
   "compilerOptions": {
-    "typeRoots": [
-      "./node_modules/@types",
-      "./node_modules/iina-plugin-definition"
-    ],
-    "jsx": "react",
-    "lib": [
-      "ES2017",
-      "DOM"
-    ]
-  }
+    "target": "ES2019",
+    "lib": ["ES2019"],
+    "moduleResolution": "node",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "files": ["node_modules/iina-plugin-definition/iina/index.d.ts", "src/index.ts", "src/global.ts"]
 }

@@ -29,6 +29,9 @@ type castConn struct {
 	conn io.ReadWriteCloser
 	addr string // remote address, for log context
 
+	localIP string // our address on the interface that reaches the device
+	onClose func() // called (in its own goroutine) once the connection is gone
+
 	writeMu sync.Mutex // serializes writes (heartbeat + control both write)
 	reqMu   sync.Mutex
 	reqID   int
@@ -70,9 +73,14 @@ func dialCast(addr string) (*castConn, error) {
 		logDebug("dial: peer cert subject=%q issuer=%q", cs.PeerCertificates[0].Subject, cs.PeerCertificates[0].Issuer)
 	}
 
+	localIP := ""
+	if ta, ok := tlsConn.LocalAddr().(*net.TCPAddr); ok {
+		localIP = ta.IP.String()
+	}
 	c := &castConn{
 		conn:    tlsConn,
 		addr:    addr,
+		localIP: localIP,
 		waiters: make(map[int]chan map[string]any),
 		done:    make(chan struct{}),
 	}
@@ -239,6 +247,9 @@ func (c *castConn) handle(seq uint64, m castMessage) {
 	// symptom is a silent stall.
 	if m.namespace == nsConnection && msgType == "CLOSE" {
 		logWarn("recv #%d: device closed the virtual connection from %s (reason: %v)", seq, m.sourceID, payload["reason"])
+		// The session is over: drop the connection so the media server is
+		// torn down instead of staying reachable on the LAN.
+		c.Close()
 		return
 	}
 
@@ -362,13 +373,19 @@ func (c *castConn) Close() {
 		if err := c.conn.Close(); err != nil {
 			logDebug("close: socket close returned: %v", err)
 		}
+		c.sessMu.Lock()
+		f := c.onClose
+		c.sessMu.Unlock()
+		if f != nil {
+			go f()
+		}
 	})
 }
 
 // launchAndLoad launches the Default Media Receiver, opens a connection to the
 // resulting session, and issues LOAD for the given media URL.
 func (c *castConn) launchAndLoad(mediaURL, contentType, title string) error {
-	logInfo("launchAndLoad: url=%s contentType=%s title=%q", mediaURL, contentType, title)
+	logInfo("launchAndLoad: contentType=%s title=%q", contentType, title)
 
 	transportID, err := c.launchReceiver()
 	if err != nil {
@@ -541,4 +558,11 @@ func shortNS(ns string) string {
 		return ns[len(prefix):]
 	}
 	return ns
+}
+
+// setOnClose registers a callback that runs once the connection is gone.
+func (c *castConn) setOnClose(f func()) {
+	c.sessMu.Lock()
+	c.onClose = f
+	c.sessMu.Unlock()
 }
