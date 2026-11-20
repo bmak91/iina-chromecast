@@ -1,8 +1,25 @@
 const { utils, http, global, core, console: IINAConsole } = iina;
 
-// The helper is built locally from go-casthelper/ (see README) and copied into
-// the plugin's data directory. Nothing is downloaded at runtime.
-const bin = utils.resolvePath("@data/casthelper");
+// The helper ships inside the plugin (bin/casthelper, built from go-casthelper/
+// by build-helper.sh). Nothing is downloaded at runtime. A copy you built
+// yourself with install-helper.sh takes precedence.
+const IDENTIFIER = "com.bmak91.iina-chromecast";
+const PLUGINS = "~/Library/Application Support/com.colliderli.iina/plugins";
+
+function findHelper(): string | null {
+  const candidates = ["@data/casthelper"];
+  // IINA installs a plugin as <identifier>.iinaplugin, or <identifier>-N if
+  // that name is taken.
+  for (const suffix of ["", "-1", "-2", "-3", "-4", "-5"]) {
+    candidates.push(`${PLUGINS}/${IDENTIFIER}${suffix}.iinaplugin/bin/casthelper`);
+  }
+  for (const c of candidates) {
+    if (utils.fileInPath(c)) return utils.resolvePath(c);
+  }
+  return null;
+}
+
+const bin = findHelper();
 const CONTROL = "http://127.0.0.1:9092";
 
 // The helper prints "READY <token>" on stdout once it is listening. Every
@@ -46,10 +63,8 @@ global.onMessage("cast:play", () => post("/play"));
 global.onMessage("cast:seek", (d) => post("/seek", d));
 global.onMessage("cast:stop", () => post("/stop"));
 
-if (!utils.fileInPath(bin)) {
-  IINAConsole.log(
-    `casthelper not found at ${bin}. Build it with ./install-helper.sh (see README).`
-  );
+if (!bin) {
+  IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
 } else {
   IINAConsole.log("Starting casthelper");
   utils

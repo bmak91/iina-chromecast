@@ -9,17 +9,25 @@ fake Cast device. The fork has not yet been run on a real IINA + Chromecast setu
 
 ## Install
 
-Requires IINA 1.4+ and Go (`brew install go`).
+In IINA: Settings → Plugins → Install from GitHub, and enter `bmak91/iina-chromecast`.
+Restart IINA, open a local video, and pick your device under the plugin menu's
+*Chromecast* entry.
+
+The first time you cast, macOS may ask whether `casthelper` may accept incoming
+connections: allow it, the TV has to fetch the video from your Mac.
+
+### The bundled helper
+
+`bin/casthelper` is a universal (arm64 + x86_64) binary built from `go-casthelper/`
+by `./build-helper.sh` with Go 1.24.7. The build is reproducible, so you can check
+that the binary matches the source:
 
 ```sh
-git clone <this repo> ~/src/iina-chromecast
-cd ~/src/iina-chromecast
-./install-helper.sh        # tests, builds and installs the helper binary
-ln -s "$PWD" ~/Library/Application\ Support/com.colliderli.iina/plugins/iina-chromecast.iinaplugin-dev
+./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
+# expected: cc0074c31240f9d1c78235d2c8dbd5314416fd67e18954e95f0c54916a03cc6e
 ```
 
-Restart IINA. The first time you cast, macOS may ask whether `casthelper` may
-accept incoming connections: allow it, the TV has to fetch the video from your Mac.
+To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
 
 `dist/` is committed unminified so it can be read; rebuild it with
 `npm install --ignore-scripts && npm run build`.
@@ -38,7 +46,7 @@ accept incoming connections: allow it, the TV has to fetch the video from your M
 | The control API on `127.0.0.1:9092` accepted any request. A web page open in your browser could POST to it and make the helper serve any file your user can read. | Every request needs a random per-launch token (`X-Cast-Token`). Requests with an `Origin` header or an unexpected `Host` are refused. |
 | The media server listened on all interfaces for as long as IINA was open and served the last cast file to anyone at `/media`. | The media server only runs during a cast session, is bound to the one address that reaches the device, uses an unguessable per-session URL, and only answers the device's IP. It stops when casting stops, the device ends the session, or IINA exits. |
 | Any path and any target host were accepted. | Only regular files with a media extension are served. The device must be a private or link-local IP address. |
-| The plugin downloaded an unsigned `casthelper` binary from the upstream repo's *latest* release and ran it at every IINA launch. | Nothing is downloaded. You build the helper from the source in this repo. |
+| The plugin downloaded an unsigned `casthelper` binary from the upstream repo's *latest* release and ran it at every IINA launch. | Nothing is downloaded at runtime. The helper ships in the repo and its build is reproducible from the source. |
 | `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `network-request`, `file-system`. |
 | A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | Logs go to stderr at info level. `-log` is opt-in and creates the file `0600`. |
 | No way to stop casting from IINA. | *Stop Casting* menu item. Casting also stops when the window closes. |

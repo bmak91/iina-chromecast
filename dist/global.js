@@ -1,7 +1,19 @@
 (() => {
   // src/global.ts
   var { utils, http, global, core, console: IINAConsole } = iina;
-  var bin = utils.resolvePath("@data/casthelper");
+  var IDENTIFIER = "com.bmak91.iina-chromecast";
+  var PLUGINS = "~/Library/Application Support/com.colliderli.iina/plugins";
+  function findHelper() {
+    const candidates = ["@data/casthelper"];
+    for (const suffix of ["", "-1", "-2", "-3", "-4", "-5"]) {
+      candidates.push(`${PLUGINS}/${IDENTIFIER}${suffix}.iinaplugin/bin/casthelper`);
+    }
+    for (const c of candidates) {
+      if (utils.fileInPath(c)) return utils.resolvePath(c);
+    }
+    return null;
+  }
+  var bin = findHelper();
   var CONTROL = "http://127.0.0.1:9092";
   var token = null;
   var stdoutBuf = "";
@@ -34,10 +46,8 @@
   global.onMessage("cast:play", () => post("/play"));
   global.onMessage("cast:seek", (d) => post("/seek", d));
   global.onMessage("cast:stop", () => post("/stop"));
-  if (!utils.fileInPath(bin)) {
-    IINAConsole.log(
-      `casthelper not found at ${bin}. Build it with ./install-helper.sh (see README).`
-    );
+  if (!bin) {
+    IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
   } else {
     IINAConsole.log("Starting casthelper");
     utils.exec(bin, ["-control", "127.0.0.1:9092", "-media", ":8010"], void 0, onHelperStdout).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));

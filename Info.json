@@ -1,7 +1,7 @@
 {
   "name": "IINA Chromecast",
-  "identifier": "com.dpacmittal.iina-chromecast",
-  "version": "0.2.0",
+  "identifier": "com.bmak91.iina-chromecast",
+  "version": "0.2.1",
   "description": "Chromecast support for IINA",
   "author": {
     "name": "Deepak Mittal",
