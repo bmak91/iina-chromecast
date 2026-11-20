@@ -185,6 +185,61 @@ function numberOrZero(get: () => number): number {
   }
 }
 
+function tryGet<T>(get: () => T, fallback: T): T {
+  try {
+    const v = get();
+    return v === undefined || v === null ? fallback : v;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+// mpv prints colours as #AARRGGBB; Cast wants #RRGGBBAA.
+function castColor(c: string): string {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{6})$/i.exec(c || "");
+  return m ? `#${m[2]}${m[1]}` : "";
+}
+
+// The subtitle track selected in IINA, with IINA's subtitle settings (delay,
+// size, position, colours) as they are when casting starts.
+function selectedSubtitle(): Record<string, any> | null {
+  const tracks = tryGet(() => mpv.getNative<any[]>("track-list"), [] as any[]);
+  if (!Array.isArray(tracks)) return null;
+  const t = tracks.find((x) => x && x.type === "sub" && x.selected);
+  if (!t) return null;
+
+  const sub: Record<string, any> = {
+    index: -1,
+    lang: typeof t.lang === "string" ? t.lang : "",
+    title: typeof t.title === "string" ? t.title : "",
+    delay: tryGet(() => mpv.getNumber("sub-delay"), 0),
+    // IINA's size setting is the font size (default 55); sub-scale multiplies it.
+    scale:
+      tryGet(() => mpv.getNumber("sub-scale"), 1) *
+      (tryGet(() => mpv.getNumber("sub-font-size"), 55) / 55),
+    pos: tryGet(() => mpv.getNumber("sub-pos"), 100),
+    color: castColor(tryGet(() => mpv.getString("sub-color"), "")),
+    borderColor: castColor(
+      tryGet(() => mpv.getString("sub-border-color"), "") ||
+        tryGet(() => mpv.getString("sub-outline-color"), "")
+    ),
+    font: tryGet(() => mpv.getString("sub-font"), ""),
+    bold: tryGet(() => mpv.getFlag("sub-bold"), false),
+    italic: tryGet(() => mpv.getFlag("sub-italic"), false),
+  };
+  if (t.external && typeof t["external-filename"] === "string") {
+    const f: string = t["external-filename"];
+    if (/^https?:\/\//i.test(f)) sub.url = f;
+    else if (f.startsWith("/")) sub.path = f;
+    else return null;
+  } else if (typeof t["ff-index"] === "number") {
+    sub.index = t["ff-index"];
+  } else {
+    return null;
+  }
+  return sub;
+}
+
 function castCurrent(device: string | null) {
   const url = core.status.url;
   const source = currentSource(url);
@@ -205,6 +260,8 @@ function castCurrent(device: string | null) {
     start: numberOrZero(() => mpv.getNumber("time-pos")),
     aid: numberOrZero(() => mpv.getNumber("aid")),
   };
+  const sub = selectedSubtitle();
+  if (sub) lastRequest.sub = sub;
   sendCast();
 }
 

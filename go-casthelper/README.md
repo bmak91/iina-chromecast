@@ -24,7 +24,7 @@ that token in an `X-Cast-Token` header. Requests carrying an `Origin` header or 
 | GET    | /devices | –                                     | Cast devices found on the LAN |
 | GET    | /status | –                                      | session state                |
 
-`/cast` takes `{device, path | url, title, start, aid}`. `device` must be a private
+`/cast` takes `{device, path | url, title, start, aid, sub}`. `device` must be a private
 or link-local IP (`ip` or `ip:8009`). `path` must be the absolute path of a regular
 media file; `url` must be an http(s) stream. `start` is the position in seconds and
 `aid` is mpv's audio track id. The reply says whether the media is served `direct`
@@ -37,6 +37,6 @@ address that reaches the device, serves at `/media/<random token>`, and answers
 only the device's IP. In convert mode the response is the output of ffmpeg
 (fragmented MP4, H.264 + AAC); `?start=<seconds>` selects where it begins.
 
-## Not handled
-
-- Subtitles.
+`sub` (optional) selects a subtitle track: `{path | url | index, lang, title, delay,
+scale, pos, color, borderColor, font, bold, italic}`. It is converted to WebVTT and
+served at `/media/<token>/subs.vtt`.

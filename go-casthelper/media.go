@@ -27,6 +27,7 @@ type source struct {
 // served as it is (with Range support, so the device seeks natively).
 type plan struct {
 	copyVideo bool    // H.264 video the device can play: repackage, don't re-encode
+	hdr       bool    // HDR video (PQ or HLG) that must be tone-mapped when re-encoded
 	hasVideo  bool    // false for audio-only sources
 	audio     int     // 0-based index of the audio track to send
 	duration  float64 // seconds, 0 if unknown
@@ -37,6 +38,7 @@ type plan struct {
 type tools struct {
 	ffmpeg, ffprobe string
 	videoEncoder    []string
+	canToneMap      bool // ffmpeg has the zscale and tonemap filters
 }
 
 var toolDirs = []string{"/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"}
@@ -116,6 +118,10 @@ func findTools(ffmpegOverride string) *tools {
 	if bytes.Contains(out, []byte("h264_videotoolbox")) {
 		t.videoEncoder = []string{"-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1"}
 	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	filters, _ := exec.CommandContext(ctx2, t.ffmpeg, "-hide_banner", "-filters").Output()
+	t.canToneMap = bytes.Contains(filters, []byte(" zscale ")) && bytes.Contains(filters, []byte(" tonemap "))
 	return t
 }
 
@@ -140,16 +146,20 @@ func parseStreamURL(s string) (string, error) {
 	return u.String(), nil
 }
 
+type probeStream struct {
+	Index       int    `json:"index"`
+	CodecType   string `json:"codec_type"`
+	CodecName   string `json:"codec_name"`
+	PixFmt      string `json:"pix_fmt"`
+	Transfer    string `json:"color_transfer"`
+	Disposition struct {
+		AttachedPic int `json:"attached_pic"`
+	} `json:"disposition"`
+}
+
 type probeResult struct {
-	Streams []struct {
-		CodecType   string `json:"codec_type"`
-		CodecName   string `json:"codec_name"`
-		PixFmt      string `json:"pix_fmt"`
-		Disposition struct {
-			AttachedPic int `json:"attached_pic"`
-		} `json:"disposition"`
-	} `json:"streams"`
-	Format struct {
+	Streams []probeStream `json:"streams"`
+	Format  struct {
 		FormatName string `json:"format_name"`
 		Duration   string `json:"duration"`
 	} `json:"format"`
@@ -158,7 +168,7 @@ type probeResult struct {
 var (
 	inputRE    = regexp.MustCompile(`(?m)^Input #0, (.+), from `)
 	durationRE = regexp.MustCompile(`(?m)^\s*Duration: (\d+):(\d+):(\d+(?:\.\d+)?)`)
-	streamRE   = regexp.MustCompile(`(?m)^\s*Stream #0:\d+.*?: (Video|Audio): (\w+)(?:\s*\([^)]*\))*(?:, (\w+))?(.*)$`)
+	streamRE   = regexp.MustCompile(`(?m)^\s*Stream #0:(\d+).*?: (Video|Audio|Subtitle): (\w+)(?:\s*\([^)]*\))*(?:, (\w+))?(.*)$`)
 )
 
 // probeWithFFmpeg reads the same facts from the banner `ffmpeg -i` prints,
@@ -186,17 +196,16 @@ func (t *tools) probeWithFFmpeg(src source) (*probeResult, error) {
 		r.Format.Duration = strconv.FormatFloat(h*3600+mi*60+s, 'f', 3, 64)
 	}
 	for _, s := range streamRE.FindAllStringSubmatch(out, -1) {
-		st := struct {
-			CodecType   string `json:"codec_type"`
-			CodecName   string `json:"codec_name"`
-			PixFmt      string `json:"pix_fmt"`
-			Disposition struct {
-				AttachedPic int `json:"attached_pic"`
-			} `json:"disposition"`
-		}{CodecType: strings.ToLower(s[1]), CodecName: s[2]}
+		st := probeStream{CodecType: strings.ToLower(s[2]), CodecName: s[3]}
+		st.Index, _ = strconv.Atoi(s[1])
 		if st.CodecType == "video" {
-			st.PixFmt = s[3]
-			if strings.Contains(s[4], "(attached pic)") {
+			st.PixFmt = s[4]
+			for _, tr := range []string{"smpte2084", "arib-std-b67"} {
+				if strings.Contains(s[5], tr) {
+					st.Transfer = tr
+				}
+			}
+			if strings.Contains(s[5], "(attached pic)") {
 				st.Disposition.AttachedPic = 1
 			}
 		}
@@ -214,7 +223,7 @@ func (t *tools) probe(src source) (*probeResult, error) {
 	cmd := exec.CommandContext(ctx, t.ffprobe,
 		"-v", "error",
 		"-protocol_whitelist", protocolWhitelist(src.isURL),
-		"-show_entries", "stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic:format=format_name,duration",
+		"-show_entries", "stream=index,codec_type,codec_name,pix_fmt,color_transfer:stream_disposition=attached_pic:format=format_name,duration",
 		"-of", "json",
 		"-i", src.location)
 	var stderr bytes.Buffer
@@ -235,13 +244,13 @@ func (t *tools) probe(src source) (*probeResult, error) {
 // (0 = unknown).
 func decide(src source, r *probeResult, aid int) *plan {
 	var video, audio string
-	var pixFmt string
+	var pixFmt, transfer string
 	audioCount := 0
 	for _, s := range r.Streams {
 		switch s.CodecType {
 		case "video":
 			if s.Disposition.AttachedPic == 0 && video == "" {
-				video, pixFmt = s.CodecName, s.PixFmt
+				video, pixFmt, transfer = s.CodecName, s.PixFmt, s.Transfer
 			}
 		case "audio":
 			if audio == "" {
@@ -259,6 +268,7 @@ func decide(src source, r *probeResult, aid int) *plan {
 	}
 	h264OK := video == "h264" && (pixFmt == "yuv420p" || pixFmt == "yuvj420p")
 	p.copyVideo = h264OK
+	p.hdr = transfer == "smpte2084" || transfer == "arib-std-b67"
 
 	if src.isURL || p.audio != 0 {
 		return p
@@ -330,7 +340,15 @@ func (t *tools) ffmpegArgs(src source, p *plan, start float64) []string {
 		args = append(args, "-map", "0:v:0")
 		args = append(args, t.videoEncoder...)
 		// 8-bit 4:2:0 at up to 1080p is what every Cast device decodes.
-		args = append(args, "-vf", "scale='min(1920,iw)':-2", "-pix_fmt", "yuv420p")
+		vf := "scale='min(1920,iw)':-2"
+		if p.hdr && t.canToneMap {
+			// HDR squeezed into SDR without tone mapping looks grey and washed
+			// out. Map it to BT.709 and label the result as such.
+			vf += ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709," +
+				"tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+			args = append(args, "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
+		}
+		args = append(args, "-vf", vf, "-pix_fmt", "yuv420p")
 	}
 	return append(args,
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",

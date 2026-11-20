@@ -81,8 +81,16 @@ function load(d: Record<string, any>, player?: string) {
   const reply = (r: Record<string, any>) => toPlayer(player, "cast:result", r);
   post("/cast", d)
     .then((res) => {
-      const converting = /"mode":\s*"convert"/.test((res && res.text) || "");
-      reply({ ok: true, message: converting ? "casting (converting on the fly)" : "casting" });
+      let body: Record<string, any> = {};
+      try {
+        body = JSON.parse((res && res.text) || "{}");
+      } catch (e) {}
+      let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
+      if (body.subs === "on") message += ", with subtitles";
+      if (body.subs === "unavailable") {
+        message += `, without subtitles (${body.subsNote || "not supported"})`;
+      }
+      reply({ ok: true, message });
     })
     .catch((e) => {
       IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);

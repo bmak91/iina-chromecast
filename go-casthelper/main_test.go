@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -117,6 +118,9 @@ func TestCastRejectsBadInput(t *testing.T) {
 	}
 }
 
+// lastLoad holds the most recent LOAD message the fake device received.
+var lastLoad atomic.Value
+
 // fakeDevice is a minimal Cast receiver: it accepts LAUNCH/LOAD and records
 // the media URL it was told to play.
 func fakeDevice(t *testing.T) (addr string, loaded chan string) {
@@ -134,6 +138,7 @@ func fakeDevice(t *testing.T) (addr string, loaded chan string) {
 	}
 	t.Cleanup(func() { ln.Close() })
 	loaded = make(chan string, 8)
+	lastLoad.Store(map[string]any{})
 
 	go func() {
 		for {
@@ -167,6 +172,7 @@ func fakeDevice(t *testing.T) (addr string, loaded chan string) {
 						reply(nsReceiver, map[string]any{"type": "RECEIVER_STATUS", "requestId": p["requestId"],
 							"status": map[string]any{"applications": []any{map[string]any{"appId": defaultReceiverAppID, "transportId": "t-1"}}}})
 					case "LOAD":
+						lastLoad.Store(p)
 						loaded <- p["media"].(map[string]any)["contentId"].(string)
 						reply(nsMedia, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"],
 							"status": []any{map[string]any{"mediaSessionId": 1, "playerState": "PLAYING"}}})
@@ -648,4 +654,180 @@ func makeLongSample(t *testing.T, tl *tools) string {
 		t.Skipf("cannot create sample: %v: %s", err, b)
 	}
 	return out
+}
+
+const sampleSRT = `1
+00:00:01,000 --> 00:00:02,500
+Before the keyframe
+
+2
+00:00:12,000 --> 00:00:14,000
+Hello <i>there</i>
+
+3
+00:00:16,000 --> 00:00:18,000
+Second line
+`
+
+func httpGetText(t *testing.T, url string) (int, string, http.Header) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b), resp.Header
+}
+
+// trackOf returns the subtitle track URL and style from the last LOAD.
+func trackOf(t *testing.T) (string, map[string]any) {
+	t.Helper()
+	media := lastLoad.Load().(map[string]any)["media"].(map[string]any)
+	tracks, _ := media["tracks"].([]any)
+	if len(tracks) != 1 {
+		t.Fatalf("LOAD carried %d tracks, want 1", len(tracks))
+	}
+	style, _ := media["textTrackStyle"].(map[string]any)
+	return tracks[0].(map[string]any)["trackContentId"].(string), style
+}
+
+func TestSubtitlesFromSeparateFileFollowIINASettings(t *testing.T) {
+	tl := testTools(t)
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+	a, srv := newTestApp(t)
+	a.tools = tl
+	tok := map[string]string{"X-Cast-Token": "secret-token"}
+
+	movie := makeLongSample(t, tl) // H.264 with one keyframe every 10 s
+	srt := filepath.Join(t.TempDir(), "movie.srt")
+	os.WriteFile(srt, []byte(sampleSRT), 0o600)
+
+	device, loaded := fakeDevice(t)
+	// Cast from 12.5 s: the copied video starts on the keyframe at 10 s.
+	body := `{"device":"` + device + `","path":"` + movie + `","start":12.5,` +
+		`"sub":{"path":"` + srt + `","index":-1,"lang":"en","delay":0.5,"scale":1.5,"pos":80,"color":"#ffff00ff"}}`
+	if mode := castForTest(t, a, srv, body); mode != "convert" {
+		t.Fatalf("mode = %q", mode)
+	}
+	<-loaded
+	subsURL, style := trackOf(t)
+	if style["fontScale"] != 1.5 || style["foregroundColor"] != "#FFFF00FF" || style["backgroundColor"] != "#00000000" {
+		t.Errorf("style = %v", style)
+	}
+	status, vtt, hdr := httpGetText(t, subsURL)
+	if status != 200 || !strings.HasPrefix(vtt, "WEBVTT") {
+		t.Fatalf("subs: %d %q", status, vtt)
+	}
+	if hdr.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("subtitle response has no CORS header")
+	}
+	// Source cue at 12.0 s, +0.5 s delay, on a stream that starts at 10 s.
+	if !strings.Contains(vtt, "00:00:02.500 --> 00:00:04.500 line:70%") || !strings.Contains(vtt, "Hello") {
+		t.Errorf("cue not shifted/placed as expected:\n%s", vtt)
+	}
+	if strings.Contains(vtt, "Before the keyframe") {
+		t.Errorf("cue from before the stream start was kept:\n%s", vtt)
+	}
+
+	// Seeking reloads with subtitles shifted to the new start (keyframe at 0).
+	if r := do(t, "POST", srv.URL+"/seek", `{"time":3}`, tok); r.StatusCode != http.StatusOK {
+		t.Fatalf("seek: %d", r.StatusCode)
+	}
+	<-loaded
+	subsURL, _ = trackOf(t)
+	if _, vtt, _ := httpGetText(t, subsURL); !strings.Contains(vtt, "00:00:12.500 --> 00:00:14.500") || !strings.Contains(vtt, "Before the keyframe") {
+		t.Errorf("after seek:\n%s", vtt)
+	}
+	do(t, "POST", srv.URL+"/stop", "", tok)
+}
+
+func TestSubtitlesFromTrackInsideTheFile(t *testing.T) {
+	tl := testTools(t)
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+	a, srv := newTestApp(t)
+	a.tools = tl
+
+	dir := t.TempDir()
+	srt := filepath.Join(dir, "in.srt")
+	os.WriteFile(srt, []byte(sampleSRT), 0o600)
+	movie := filepath.Join(dir, "movie.mkv")
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=20:size=320x240:rate=25",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-i", srt,
+		"-map", "0:v", "-map", "1:a", "-map", "2:s",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-c:s", "srt", movie}
+	if b, err := exec.Command(tl.ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Skipf("cannot create sample: %v: %s", err, b)
+	}
+
+	device, loaded := fakeDevice(t)
+	// Stream 2 is the subtitle track; stream 1 (audio) must be refused as one.
+	if castForTest(t, a, srv, `{"device":"`+device+`","path":"`+movie+`","sub":{"index":2}}`); true {
+		<-loaded
+		subsURL, _ := trackOf(t)
+		if status, vtt, _ := httpGetText(t, subsURL); status != 200 || !strings.Contains(vtt, "Hello") || !strings.Contains(vtt, ":12.0") {
+			t.Errorf("embedded subs: %d\n%s", status, vtt)
+		}
+	}
+	castForTest(t, a, srv, `{"device":"`+device+`","path":"`+movie+`","sub":{"index":1}}`)
+	<-loaded
+	media := lastLoad.Load().(map[string]any)["media"].(map[string]any)
+	if _, has := media["tracks"]; has {
+		t.Errorf("an audio stream was accepted as a subtitle track")
+	}
+}
+
+func TestSubtitlePathMustBeASubtitleFile(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "id_rsa")
+	os.WriteFile(secret, []byte("x"), 0o600)
+	for _, req := range []subRequest{{Path: secret}, {Path: "relative.srt"}, {Path: dir}, {URL: "file:///etc/passwd"}, {Index: -1}} {
+		if _, _, err := resolveSubtitle(&req, source{location: "/x.mkv"}, &probeResult{}); err == nil {
+			t.Errorf("accepted %+v", req)
+		}
+	}
+}
+
+func TestHDRVideoIsToneMappedWhenReencoded(t *testing.T) {
+	tl := testTools(t)
+	if !tl.canToneMap {
+		t.Skip("ffmpeg has no zscale/tonemap filters")
+	}
+	hdr := makeSample(t, tl, "hdr.mkv", "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+		"-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-c:a", "ac3")
+	src := source{location: hdr}
+	for _, withProbe := range []bool{true, false} {
+		tt := *tl
+		if !withProbe {
+			tt.ffprobe = ""
+		}
+		r, err := tt.probe(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := decide(src, r, 0)
+		if p == nil || !p.hdr || p.copyVideo {
+			t.Fatalf("ffprobe=%v: plan = %+v, want HDR re-encode", withProbe, p)
+		}
+		out := filepath.Join(t.TempDir(), "out.mp4")
+		args := tt.ffmpegArgs(src, p, 0)
+		args[len(args)-1] = out
+		if b, err := exec.Command(tl.ffmpeg, append([]string{"-y"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg: %v: %s", err, b)
+		}
+		o, _ := exec.Command(tl.ffprobe, "-v", "error", "-select_streams", "v:0",
+			"-show_entries", "stream=codec_name,pix_fmt,color_transfer", "-of", "csv=p=0", out).Output()
+		if got := strings.TrimSpace(string(o)); got != "h264,yuv420p,bt709" {
+			t.Errorf("output video is %q, want h264,yuv420p,bt709", got)
+		}
+	}
+	// SDR sources are left alone.
+	sdr := makeSample(t, tl, "sdr.mkv", "-c:v", "libx265", "-preset", "ultrafast", "-c:a", "ac3")
+	r, _ := tl.probe(source{location: sdr})
+	if p := decide(source{location: sdr}, r, 0); p == nil || p.hdr {
+		t.Errorf("SDR plan = %+v", p)
+	}
 }

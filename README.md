@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: 6605cf7c25732031eb74e814da2e4d5abc4f8b18edf0009e57d5dca78e08c927
+# expected: 3a28c2681ae1d16da3c19c88e4dd02bebdd386c59893d8bebaa2d3434ce1357d
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -68,6 +68,19 @@ The helper inspects the source with `ffprobe` and picks one of three paths:
 Network streams (http/https URLs opened in IINA) always go through ffmpeg, because
 the device cannot reach an address that only exists on your Mac.
 
+HDR video that has to be re-encoded is tone-mapped to standard range when ffmpeg
+has the `zscale` and `tonemap` filters (Homebrew's build does).
+
+### Subtitles
+
+The subtitle track selected in IINA when casting starts is sent as a text track:
+either a track inside the file or a separately loaded subtitle file. IINA's subtitle
+delay, size, vertical position, colours and font are applied as they are at that
+moment. Changing them later needs a new cast. Picture-based subtitles (PGS, DVD)
+cannot be sent, and styled ASS subtitles arrive as plain text. A track inside a
+large file or a network stream can take a while to show up, because the whole
+file has to be read to collect it.
+
 Casting starts at IINA's current position and uses the audio track selected in
 IINA. Seeking in IINA while converting restarts the conversion at the new position.
 
@@ -91,8 +104,8 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
   device is not authenticated. Someone already able to intercept traffic on your LAN
   could impersonate the TV.
 - The video travels to the TV over plain HTTP on your LAN.
-- No subtitles on the device yet.
-- Converted audio is stereo AAC. HDR video is converted without tone mapping, so
-  colours can look washed out.
+- Converted audio is stereo AAC.
+- Tone mapping HDR is done in software and may not keep up with 4K sources on
+  slower Macs.
 - While casting, IINA is the remote: the local player stays paused and muted, and
   play/pause toggles the TV. IINA's own timeline does not follow the TV's position.

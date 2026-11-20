@@ -42,6 +42,7 @@ type app struct {
 	title       string       // shown on the device
 	contentType string       // content type advertised to the device in LOAD
 	mediaURL    string       // URL handed to the device for this session
+	subs        *subtitleJob // subtitle track being sent, or nil
 	mediaToken  string       // random path component for the current session
 	deviceIP    netip.Addr   // the only address allowed to fetch the media
 	cast        *castConn    // active connection, or nil
@@ -309,11 +310,13 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	path := src.location
 
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	got := strings.TrimPrefix(r.URL.Path, "/media/")
+	wantSubs := strings.HasSuffix(got, "/subs.vtt")
+	got = strings.TrimSuffix(got, "/subs.vtt")
 	if path == "" || token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
 		http.NotFound(w, r)
 		return
@@ -322,6 +325,26 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 	if err != nil || remote.Addr().Unmap() != device {
 		logWarn("media: refused request from %s (only %s may fetch)", r.RemoteAddr, device)
 		http.NotFound(w, r)
+		return
+	}
+
+	// The receiver loads text tracks, and then the video too, with CORS. The
+	// URL is unguessable and only the device's address gets this far, so
+	// allowing any origin gives nothing away.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Range, Content-Type, Accept-Encoding")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if wantSubs {
+		a.mu.Lock()
+		job := a.subs
+		a.mu.Unlock()
+		a.serveSubtitles(w, r, job)
 		return
 	}
 
@@ -354,12 +377,13 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 type castRequest struct {
-	Device string  `json:"device"` // "192.168.1.50" or "192.168.1.50:8009"
-	Path   string  `json:"path"`   // absolute path of a local file, or
-	URL    string  `json:"url"`    // http(s) URL of a network stream
-	Title  string  `json:"title"`  // shown on the device
-	Start  float64 `json:"start"`  // position to start at, in seconds
-	Aid    float64 `json:"aid"`    // mpv's 1-based audio track id, 0 = default
+	Device string      `json:"device"` // "192.168.1.50" or "192.168.1.50:8009"
+	Path   string      `json:"path"`   // absolute path of a local file, or
+	URL    string      `json:"url"`    // http(s) URL of a network stream
+	Title  string      `json:"title"`  // shown on the device
+	Start  float64     `json:"start"`  // position to start at, in seconds
+	Aid    float64     `json:"aid"`    // mpv's 1-based audio track id, 0 = default
+	Sub    *subRequest `json:"sub"`    // subtitle track to send, optional
 }
 
 // parseDevice accepts only a literal private/link-local IP (optionally with a
@@ -458,10 +482,12 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 
 	// Decide whether the device can play the source as it is.
 	var pl *plan
+	var probed *probeResult
 	contentType := "video/mp4"
 	switch {
 	case a.tools != nil:
-		probed, err := a.tools.probe(src)
+		var err error
+		probed, err = a.tools.probe(src)
 		if err != nil {
 			logError("cast: cannot read the media: %v", err)
 			http.Error(w, "cannot read the media", http.StatusUnprocessableEntity)
@@ -476,6 +502,23 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 	}
 	if pl == nil {
 		contentType = directContentType(src.location)
+	}
+
+	// Subtitles are optional: if they cannot be sent, cast without them.
+	var subsIn source
+	var subsSelector, subsNote string
+	if req.Sub != nil {
+		switch {
+		case a.tools == nil:
+			subsNote = "ffmpeg is needed for subtitles"
+		default:
+			var err error
+			subsIn, subsSelector, err = resolveSubtitle(req.Sub, src, probed)
+			if err != nil {
+				logWarn("cast: no subtitles: %v", err)
+				subsNote = err.Error()
+			}
+		}
 	}
 	// One session at a time: drop whatever was being served before.
 	a.stopSession(false)
@@ -520,6 +563,9 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 	a.src, a.plan, a.title, a.contentType = src, pl, req.Title, contentType
 	a.mediaURL, a.mediaToken, a.deviceIP = mediaURL, mediaToken, device.Addr()
 	a.cast, a.mediaSrv = conn, srv
+	if subsSelector != "" {
+		a.subs = a.tools.startSubtitleJob(subsIn, subsSelector, req.Sub)
+	}
 	a.mu.Unlock()
 	conn.setOnClose(func() { a.endSession(conn) })
 
@@ -537,7 +583,14 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 	if pl != nil {
 		mode = "convert"
 	}
-	writeJSON(w, map[string]any{"ok": true, "mode": mode})
+	subs := "none"
+	switch {
+	case subsSelector != "":
+		subs = "on"
+	case req.Sub != nil:
+		subs = "unavailable"
+	}
+	writeJSON(w, map[string]any{"ok": true, "mode": mode, "subs": subs, "subsNote": subsNote})
 }
 
 // mediaInfoAt describes the current session's media starting at the given
@@ -545,16 +598,33 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 // is baked into the URL and ffmpeg starts there.
 func (a *app) mediaInfoAt(start float64) mediaInfo {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	src, pl, job, tl := a.src, a.plan, a.subs, a.tools
 	m := mediaInfo{url: a.mediaURL, contentType: a.contentType, title: a.title, startTime: start}
-	if a.plan != nil {
+	a.mu.Unlock()
+
+	offset := 0.0
+	if pl != nil {
 		m.startTime = 0
 		if start > 0 {
 			m.url += "?start=" + strconv.FormatFloat(start, 'f', 3, 64)
+			offset = start
+			if tl != nil {
+				// Where the converted stream really begins (see streamStart).
+				offset = tl.streamStart(src, pl, start)
+			}
 		}
-		if a.plan.duration > start {
-			m.duration = a.plan.duration - start
+		if pl.duration > offset {
+			m.duration = pl.duration - offset
 		}
+	}
+	if job != nil {
+		base := m.url
+		if i := strings.IndexByte(base, '?'); i >= 0 {
+			base = base[:i]
+		}
+		m.subsURL = base + "/subs.vtt?offset=" + strconv.FormatFloat(offset, 'f', 3, 64)
+		m.subsName, m.subsLang = job.name, job.lang
+		m.subsStyle = job.req.textTrackStyle()
 	}
 	return m
 }
@@ -569,6 +639,10 @@ func (a *app) endSession(conn *castConn) {
 	srv := a.mediaSrv
 	a.cast, a.mediaSrv = nil, nil
 	a.src, a.plan = source{}, nil
+	if a.subs != nil {
+		a.subs.cancel()
+		a.subs = nil
+	}
 	a.title, a.contentType, a.mediaURL, a.mediaToken = "", "", "", ""
 	a.deviceIP = netip.Addr{}
 	if a.convCancel != nil {

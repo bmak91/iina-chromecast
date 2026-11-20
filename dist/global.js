@@ -59,8 +59,17 @@
   function load(d, player) {
     const reply = (r) => toPlayer(player, "cast:result", r);
     post("/cast", d).then((res) => {
-      const converting = /"mode":\s*"convert"/.test(res && res.text || "");
-      reply({ ok: true, message: converting ? "casting (converting on the fly)" : "casting" });
+      let body = {};
+      try {
+        body = JSON.parse(res && res.text || "{}");
+      } catch (e) {
+      }
+      let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
+      if (body.subs === "on") message += ", with subtitles";
+      if (body.subs === "unavailable") {
+        message += `, without subtitles (${body.subsNote || "not supported"})`;
+      }
+      reply({ ok: true, message });
     }).catch((e) => {
       IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);
       reply({ ok: false, message: failureMessage(e), needsFfmpeg: !!e && e.statusCode === 424 });

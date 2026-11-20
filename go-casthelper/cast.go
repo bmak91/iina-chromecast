@@ -414,6 +414,11 @@ type mediaInfo struct {
 	title       string
 	startTime   float64 // position to start at, in seconds
 	duration    float64 // total length in seconds, 0 if unknown
+
+	subsURL   string // WebVTT text track, empty for none
+	subsName  string
+	subsLang  string
+	subsStyle map[string]any // Cast textTrackStyle
 }
 
 // load issues LOAD on the already launched receiver. It can be called again
@@ -443,6 +448,24 @@ func (c *castConn) load(m mediaInfo) error {
 		"autoplay":    true,
 		"currentTime": m.startTime,
 		"media":       media,
+	}
+	if m.subsURL != "" {
+		track := map[string]any{
+			"trackId":          1,
+			"type":             "TEXT",
+			"subtype":          "SUBTITLES",
+			"trackContentId":   m.subsURL,
+			"trackContentType": "text/vtt",
+			"name":             m.subsName,
+		}
+		if m.subsLang != "" {
+			track["language"] = m.subsLang
+		}
+		media["tracks"] = []any{track}
+		if m.subsStyle != nil {
+			media["textTrackStyle"] = m.subsStyle
+		}
+		load["activeTrackIds"] = []int{1}
 	}
 	logInfo("launchAndLoad: sending LOAD to %s", transportID)
 	reply, err := c.request(nsMedia, transportID, load)
