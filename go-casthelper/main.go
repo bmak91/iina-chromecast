@@ -58,7 +58,9 @@ type app struct {
 	discovery discovery // Cast devices seen on the LAN
 
 	quit chan os.Signal // receives the signal that ends the helper
-	conv *converter     // running conversion, if any
+
+	ended string     // why the last session ended, "" while one is running or none has
+	conv  *converter // running conversion, if any
 
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
@@ -157,6 +159,13 @@ func main() {
 		os.Exit(1)
 	}
 	logInfo("control API listening on %s", ctrlLn.Addr())
+	// This helper owns the port, so it also owns keeping the log bounded.
+	rotateLog(*logPath)
+	go func() {
+		for range time.Tick(10 * time.Minute) {
+			rotateLog(*logPath)
+		}
+	}()
 	ctrlSrv := &http.Server{
 		Handler:           a.controlMux(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -240,7 +249,17 @@ func (a *app) controlMux() http.Handler {
 		casting := a.cast != nil
 		a.mu.Unlock()
 		list := a.discovery.list()
-		writeJSON(w, map[string]any{"devices": list, "casting": casting, "problem": a.discovery.status()})
+		reply := map[string]any{"devices": list, "casting": casting, "problem": a.discovery.status()}
+		a.mu.Lock()
+		conn, ended := a.cast, a.ended
+		a.mu.Unlock()
+		reply["ended"] = ended
+		if conn != nil {
+			conn.sessMu.Lock()
+			reply["playerState"], reply["idleReason"] = conn.playerState, conn.idleReason
+			conn.sessMu.Unlock()
+		}
+		writeJSON(w, reply)
 	})))
 	mux.HandleFunc("/status", a.logged("ctrl", a.guard(http.MethodGet, a.handleStatus)))
 	mux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {
@@ -599,7 +618,29 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 		a.subs = a.tools.startSubtitleJob(subsIn, subsSelector, req.Sub)
 	}
 	a.mu.Unlock()
-	conn.setOnClose(func() { a.endSession(conn) })
+	conn.setOnClose(func() {
+		if a.endSession(conn) {
+			a.noteEnd("the device closed the connection")
+		}
+	})
+	conn.sessMu.Lock()
+	conn.onEnded = func(reason string, at float64) {
+		logInfo("cast: the device stopped playing (%s) at %.1fs", reason, at)
+		why := "playback finished"
+		if reason == "error" {
+			why = fmt.Sprintf("the device reported a playback error at %s", clock(at))
+			if e := a.convError(); e != "" {
+				why += " (conversion failed: " + e + ")"
+			}
+		}
+		if a.endSession(conn) {
+			a.noteEnd(why)
+		}
+		conn.stopReceiver()
+		conn.Close()
+	}
+	conn.sessMu.Unlock()
+	a.noteEnd("")
 
 	if err := conn.launchAndLoad(a.mediaInfoAt(req.Start)); err != nil {
 		logError("cast: launchAndLoad failed: %v", err)
@@ -661,12 +702,44 @@ func (a *app) mediaInfoAt(start float64) mediaInfo {
 	return m
 }
 
-// endSession stops serving media if conn is still the active session.
-func (a *app) endSession(conn *castConn) {
+// noteEnd records why the last session ended, for the plugin to show.
+func (a *app) noteEnd(why string) {
+	a.mu.Lock()
+	a.ended = why
+	a.mu.Unlock()
+	if why != "" {
+		logInfo("cast: session ended: %s", why)
+	}
+}
+
+// convError returns why the running conversion failed, or "".
+func (a *app) convError() string {
+	a.mu.Lock()
+	conv := a.conv
+	a.mu.Unlock()
+	if conv == nil {
+		return ""
+	}
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	if conv.err != nil {
+		return truncate(conv.err.Error(), 200)
+	}
+	return ""
+}
+
+func clock(sec float64) string {
+	s := int(sec)
+	return fmt.Sprintf("%d:%02d:%02d", s/3600, s/60%60, s%60)
+}
+
+// endSession stops serving media if conn is still the active session, and
+// reports whether it was.
+func (a *app) endSession(conn *castConn) bool {
 	a.mu.Lock()
 	if a.cast != conn {
 		a.mu.Unlock()
-		return
+		return false
 	}
 	srv := a.mediaSrv
 	a.cast, a.mediaSrv = nil, nil
@@ -686,6 +759,7 @@ func (a *app) endSession(conn *castConn) {
 		srv.Close()
 		logInfo("media server stopped")
 	}
+	return true
 }
 
 // stopSession ends the active session, if any. With stopDevice set it also

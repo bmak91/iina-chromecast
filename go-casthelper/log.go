@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -41,15 +42,17 @@ func setupLogging(path string, level int) {
 
 	w := io.Writer(os.Stderr)
 	if path != "" {
-		// The log is always on. Keep the previous run next to it and stop
-		// each file at 2 MB, so it never grows without bound.
+		// The log is always on. It is opened for appending and never
+		// truncated here: a helper that turns out to be redundant (the port
+		// is taken) must not wipe the log of the helper that is doing the
+		// work. rotateLog trims it once this helper knows it is the one.
 		_ = os.MkdirAll(filepath.Dir(path), 0o700)
-		_ = os.Rename(path, strings.TrimSuffix(path, filepath.Ext(path))+".prev"+filepath.Ext(path))
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			logger.Printf("[ERROR] cannot open log file %s: %v (stderr only)", path, err)
 		} else {
-			w = io.MultiWriter(os.Stderr, &cappedWriter{w: f, left: 2 << 20})
+			logFile = &swappableWriter{f: f}
+			w = io.MultiWriter(os.Stderr, logFile)
 		}
 	}
 	logger.SetOutput(w)
@@ -94,20 +97,42 @@ func hexdump(b []byte, max int) string {
 	return hex.EncodeToString(b)
 }
 
-// cappedWriter silently drops everything after its byte budget is used up.
-type cappedWriter struct {
-	w    io.Writer
-	left int
+var logFile *swappableWriter
+
+// swappableWriter is the log file; rotateLog can replace the file under it.
+type swappableWriter struct {
+	mu sync.Mutex
+	f  *os.File
 }
 
-func (c *cappedWriter) Write(b []byte) (int, error) {
-	if c.left > 0 {
-		n := len(b)
-		if n > c.left {
-			n = c.left
-		}
-		c.w.Write(b[:n])
-		c.left -= n
-	}
+func (s *swappableWriter) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.f.Write(b)
 	return len(b), nil
+}
+
+// rotateLog keeps the log bounded: once it passes 2 MB the current file
+// becomes <name>.prev<ext> and a new one is started. Only the helper that owns
+// the control port calls this, at start and then periodically.
+func rotateLog(path string) {
+	if logFile == nil || path == "" {
+		return
+	}
+	logFile.mu.Lock()
+	defer logFile.mu.Unlock()
+	st, err := logFile.f.Stat()
+	if err != nil || st.Size() < 2<<20 {
+		return
+	}
+	prev := strings.TrimSuffix(path, filepath.Ext(path)) + ".prev" + filepath.Ext(path)
+	if err := os.Rename(path, prev); err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	logFile.f.Close()
+	logFile.f = f
 }

@@ -40,9 +40,12 @@ type castConn struct {
 	waitMu  sync.Mutex
 	waiters map[int]chan map[string]any
 
-	sessMu                  sync.Mutex
-	transportID             string
-	mediaSessionID          int
+	sessMu         sync.Mutex
+	transportID    string
+	mediaSessionID int
+	hasPlayed      bool                            // the current media got as far as playing
+	onEnded        func(reason string, at float64) // called when the device stops on its own
+
 	loggedState, loggedIdle string // last state written to the log
 	loggedAt                time.Time
 
@@ -346,6 +349,23 @@ func (c *castConn) logMediaStatus(seq uint64, payload map[string]any) {
 		logInfo("recv #%d: MEDIA_STATUS session=%d playerState=%s currentTime=%.1fs ahead=%.1fs idleReason=%q", seq, session, state, cur, buffered, idle)
 		if media, ok := s0["media"].(map[string]any); ok {
 			logDebug("recv #%d:   media contentId=%v contentType=%v duration=%v", seq, media["contentId"], media["contentType"], media["duration"])
+		}
+		// Playback is over when the device goes idle because the media
+		// finished or failed. (CANCELLED and INTERRUPTED also happen when we
+		// replace the media ourselves after a seek, so they don't count.)
+		if state == "PLAYING" || state == "BUFFERING" || state == "PAUSED" {
+			c.sessMu.Lock()
+			c.hasPlayed = true
+			c.sessMu.Unlock()
+		}
+		if state == "IDLE" && (idle == "FINISHED" || idle == "ERROR") {
+			c.sessMu.Lock()
+			played, f := c.hasPlayed, c.onEnded
+			c.hasPlayed = false
+			c.sessMu.Unlock()
+			if played && f != nil {
+				go f(strings.ToLower(idle), cur)
+			}
 		}
 		if idle == "ERROR" {
 			logError("recv #%d: device went IDLE with idleReason=ERROR — it tried to fetch or play the "+

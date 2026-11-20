@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.6.1",
+    version: "0.6.2",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 21
+    ghVersion: 22
   };
 
   // src/log.ts
@@ -189,6 +189,7 @@ ${v.stack || ""}`;
   var ticks = 0;
   var emptyAnswers = 0;
   var lastProblem = "";
+  var lastState = "";
   function tick() {
     ticks += 1;
     while (inbox.length > 0) {
@@ -221,10 +222,16 @@ ${v.stack || ""}`;
       log(problem ? `discovery problem: ${problem}` : "discovery is working");
     }
     if (list.length > 0 || ticks > (problem ? 45 : 8)) setDevices(list);
+    const state = casting ? `${body.playerState || "?"}${body.idleReason ? `/${body.idleReason}` : ""}` : "";
+    if (state !== lastState) {
+      lastState = state;
+      if (state) log("device state:", state);
+    }
     if (body.casting === false && casting && castConfirmed) {
-      log("the helper reports the session has ended");
+      const why = typeof body.ended === "string" && body.ended ? body.ended : "no reason given";
+      log("the session has ended:", why);
       endCasting();
-      core.osd("Chromecast: casting ended");
+      core.osd(`Chromecast: casting ended (${why})`);
     }
   }
   function setCasting(on) {

@@ -118,6 +118,10 @@ func TestCastRejectsBadInput(t *testing.T) {
 	}
 }
 
+// deviceStopsWith makes the fake device go idle with this reason shortly after
+// it starts playing ("" = keep playing).
+var deviceStopsWith atomic.Value
+
 // lastLoad holds the most recent LOAD message the fake device received.
 var lastLoad atomic.Value
 
@@ -176,6 +180,14 @@ func fakeDevice(t *testing.T) (addr string, loaded chan string) {
 						loaded <- p["media"].(map[string]any)["contentId"].(string)
 						reply(nsMedia, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"],
 							"status": []any{map[string]any{"mediaSessionId": 1, "playerState": "PLAYING"}}})
+						if reason := deviceStopsWith.Load(); reason != nil && reason.(string) != "" {
+							// Play briefly, then stop by itself.
+							go func(reason string) {
+								time.Sleep(300 * time.Millisecond)
+								reply(nsMedia, map[string]any{"type": "MEDIA_STATUS", "requestId": 0,
+									"status": []any{map[string]any{"mediaSessionId": 1, "playerState": "IDLE", "idleReason": reason, "currentTime": 3723.0}}})
+							}(reason.(string))
+						}
 					case "PLAY", "PAUSE":
 						state := map[string]any{"PLAY": "PLAYING", "PAUSE": "PAUSED"}[p["type"].(string)]
 						reply(m.namespace, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"],
@@ -957,4 +969,37 @@ func TestConvertedStreamSurvivesReconnects(t *testing.T) {
 		t.Errorf("seeking did not start a new conversion")
 	}
 	do(t, "POST", srv.URL+"/stop", "", tok)
+}
+
+// When the device stops by itself, the helper must end the session and say why.
+func TestHelperReportsWhyTheDeviceStopped(t *testing.T) {
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false; deviceStopsWith.Store("") })
+	tok := map[string]string{"X-Cast-Token": "secret-token"}
+
+	for reason, want := range map[string]string{"ERROR": "playback error at 1:02:03", "FINISHED": "playback finished"} {
+		a, srv := newTestApp(t)
+		movie := filepath.Join(t.TempDir(), "movie.mp4")
+		os.WriteFile(movie, []byte("x"), 0o600)
+		deviceStopsWith.Store(reason)
+		device, loaded := fakeDevice(t)
+		castForTest(t, a, srv, `{"device":"`+device+`","path":"`+movie+`"}`)
+		<-loaded
+
+		var st struct {
+			Casting bool
+			Ended   string
+		}
+		for i := 0; i < 40; i++ {
+			time.Sleep(100 * time.Millisecond)
+			resp := do(t, "GET", srv.URL+"/devices", "", tok)
+			json.NewDecoder(resp.Body).Decode(&st)
+			if !st.Casting {
+				break
+			}
+		}
+		if st.Casting || !strings.Contains(st.Ended, want) {
+			t.Errorf("%s: casting=%v ended=%q, want ended to contain %q", reason, st.Casting, st.Ended, want)
+		}
+	}
 }

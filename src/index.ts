@@ -135,6 +135,7 @@ function setDevices(list: Device[]) {
 let ticks = 0;
 let emptyAnswers = 0;
 let lastProblem = "";
+let lastState = "";
 
 function tick() {
   ticks += 1;
@@ -179,11 +180,20 @@ function onDevices(r: Reply) {
   }
   if (list.length > 0 || ticks > (problem ? 45 : 8)) setDevices(list);
 
-  // The session ended on the device (stopped with the TV remote, TV off...).
+  // Keep a trail of what the device is doing in this log too.
+  const state = casting ? `${body.playerState || "?"}${body.idleReason ? `/${body.idleReason}` : ""}` : "";
+  if (state !== lastState) {
+    lastState = state;
+    if (state) log("device state:", state);
+  }
+
+  // The session ended on the device (finished, failed, stopped with the TV
+  // remote, TV off...). The helper says why.
   if (body.casting === false && casting && castConfirmed) {
-    log("the helper reports the session has ended");
+    const why = typeof body.ended === "string" && body.ended ? body.ended : "no reason given";
+    log("the session has ended:", why);
     endCasting();
-    core.osd("Chromecast: casting ended");
+    core.osd(`Chromecast: casting ended (${why})`);
   }
 }
 
