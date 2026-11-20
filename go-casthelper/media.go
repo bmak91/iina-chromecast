@@ -305,13 +305,22 @@ func (t *tools) ffmpegArgs(src source, p *plan, start float64) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if start > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(start, 'f', 3, 64))
+		if p.hasVideo && p.copyVideo {
+			// Copied video can only start on a keyframe, which may be several
+			// seconds before the requested position. Start the audio there
+			// too instead of at the exact position.
+			args = append(args, "-noaccurate_seek")
+		}
 	}
 	args = append(args,
 		"-protocol_whitelist", protocolWhitelist(src.isURL),
 		"-i", src.location,
 		"-sn", "-dn",
 		"-map", fmt.Sprintf("0:a:%d?", p.audio),
-		"-c:a", "aac", "-ac", "2", "-b:a", "192k")
+		"-c:a", "aac", "-ac", "2", "-b:a", "192k",
+		// Stretch or pad the audio to follow its timestamps, so glitches in the
+		// source do not accumulate into drift against the picture.
+		"-af", "aresample=async=1")
 	switch {
 	case !p.hasVideo:
 		args = append(args, "-vn")

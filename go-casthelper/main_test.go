@@ -575,3 +575,64 @@ func TestDevicesEndpointFindsADeviceQuickly(t *testing.T) {
 		t.Errorf("/devices without token: got %d", r.StatusCode)
 	}
 }
+
+// firstPTS returns the timestamp of the first real packet of a stream. For
+// audio the encoder's priming packet at 0 is skipped.
+func firstPTS(t *testing.T, tl *tools, file, stream string) float64 {
+	t.Helper()
+	out, err := exec.Command(tl.ffprobe, "-v", "error", "-select_streams", stream,
+		"-show_entries", "packet=pts_time", "-of", "csv=p=0", file).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(out))
+	if len(lines) < 3 {
+		t.Fatalf("stream %s has %d packets", stream, len(lines))
+	}
+	i := 0
+	if strings.HasPrefix(stream, "a") {
+		i = 1
+	}
+	v, _ := strconv.ParseFloat(strings.Trim(lines[i], ","), 64)
+	return v
+}
+
+// Casting from the middle of a file must not shift audio against video. With
+// copied video the stream can only start on a keyframe, here up to 10 seconds
+// before the requested position, and the audio has to start there as well.
+func TestAudioAndVideoStartTogetherAfterSeek(t *testing.T) {
+	tl := testTools(t)
+	movie := makeLongSample(t, tl)
+	src := source{location: movie}
+	r, err := tl.probe(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, copyVideo := range []bool{true, false} {
+		p := decide(src, r, 0)
+		p.copyVideo = copyVideo
+		out := filepath.Join(t.TempDir(), "out.mp4")
+		args := tl.ffmpegArgs(src, p, 7.3)
+		args[len(args)-1] = out
+		if b, err := exec.Command(tl.ffmpeg, append([]string{"-y"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg: %v: %s", err, b)
+		}
+		v, a := firstPTS(t, tl, out, "v:0"), firstPTS(t, tl, out, "a:0")
+		if d := a - v; d > 0.15 || d < -0.15 {
+			t.Errorf("copyVideo=%v: audio starts at %.3fs, video at %.3fs", copyVideo, a, v)
+		}
+	}
+}
+
+func makeLongSample(t *testing.T, tl *tools) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "long.mkv")
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=20:size=320x240:rate=25",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "250", "-bf", "2", "-pix_fmt", "yuv420p", "-c:a", "ac3", out}
+	if b, err := exec.Command(tl.ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Skipf("cannot create sample: %v: %s", err, b)
+	}
+	return out
+}

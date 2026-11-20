@@ -67,12 +67,18 @@ function failureMessage(e: any): string {
   return text ? `failed: ${text}` : "failed";
 }
 
+// Network callbacks run on a background thread. Calling into a player window's
+// script from there misbehaves (lookups fail, IINA can hang), so always hop to
+// the main thread before posting to a player. Timers fire on the main thread.
+function toPlayer(player: string | undefined, name: string, data: Record<string, any>) {
+  if (!player) return;
+  setTimeout(() => global.postMessage(player, name, data), 0);
+}
+
 // Results go back to the player window that asked. (A null target would only
 // reach players created by the plugin, not the user's windows.)
 function load(d: Record<string, any>, player?: string) {
-  const reply = (r: Record<string, any>) => {
-    if (player) global.postMessage(player, "cast:result", r);
-  };
+  const reply = (r: Record<string, any>) => toPlayer(player, "cast:result", r);
   post("/cast", d)
     .then((res) => {
       const converting = /"mode":\s*"convert"/.test((res && res.text) || "");
@@ -88,7 +94,7 @@ function load(d: Record<string, any>, player?: string) {
 global.onMessage("cast:load", (d, player) => load(d, player));
 global.onMessage("cast:devices", (_d, player) => {
   if (!player) return;
-  const reply = (r: Record<string, any>) => global.postMessage(player, "cast:devices:list", r);
+  const reply = (r: Record<string, any>) => toPlayer(player, "cast:devices:list", r);
   if (!token) {
     reply({ ok: false });
     return;

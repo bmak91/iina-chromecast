@@ -52,10 +52,12 @@
     const text = e && typeof e.text === "string" ? e.text.trim() : "";
     return text ? `failed: ${text}` : "failed";
   }
+  function toPlayer(player, name, data) {
+    if (!player) return;
+    setTimeout(() => global.postMessage(player, name, data), 0);
+  }
   function load(d, player) {
-    const reply = (r) => {
-      if (player) global.postMessage(player, "cast:result", r);
-    };
+    const reply = (r) => toPlayer(player, "cast:result", r);
     post("/cast", d).then((res) => {
       const converting = /"mode":\s*"convert"/.test(res && res.text || "");
       reply({ ok: true, message: converting ? "casting (converting on the fly)" : "casting" });
@@ -67,7 +69,7 @@
   global.onMessage("cast:load", (d, player) => load(d, player));
   global.onMessage("cast:devices", (_d, player) => {
     if (!player) return;
-    const reply = (r) => global.postMessage(player, "cast:devices:list", r);
+    const reply = (r) => toPlayer(player, "cast:devices:list", r);
     if (!token) {
       reply({ ok: false });
       return;

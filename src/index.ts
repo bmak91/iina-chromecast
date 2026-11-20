@@ -12,6 +12,12 @@ const {
 
 IINAConsole.log("Plugin is running");
 
+// Messages and promise callbacks can arrive on a background thread, where
+// touching the UI crashes or hangs IINA. Timers always fire on the main thread.
+const onMain = (fn: () => void) => {
+  setTimeout(fn, 0);
+};
+
 // --- Devices and menu --------------------------------------------------------
 //
 // The helper keeps a live list of Cast devices (it asks the network directly,
@@ -66,9 +72,10 @@ global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[] }) => {
     }));
     if (list.length > 0) {
       setDevices(list);
-    } else {
-      slowScan();
+    } else if (r.ok) {
+      slowScan(); // the helper is up but sees nothing: try the old scan
     }
+    // Not ok: the helper is still starting. The next poll asks again.
   });
 });
 
@@ -173,12 +180,6 @@ function sendCast() {
   core.osd("Chromecast: connecting…");
   setCasting(true);
   global.postMessage("cast:load", lastRequest);
-}
-
-// Messages and promise callbacks can arrive on a background thread, where
-// showing a dialog crashes IINA. Timers always fire on the main thread.
-function onMain(fn: () => void) {
-  setTimeout(fn, 0);
 }
 
 // The global entry reports how the cast request went.

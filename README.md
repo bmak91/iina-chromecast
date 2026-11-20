@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: 2eaa9aea1e0ac84a8e98cc0585d78752fa9835b367ae15466bf5dad31e66d83e
+# expected: edded069124eda0405753656e68e09785a570f3e1deefd2fe866624786a74bb6
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.

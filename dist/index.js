@@ -139,6 +139,9 @@
     menu
   } = iina;
   IINAConsole.log("Plugin is running");
+  var onMain = (fn) => {
+    setTimeout(fn, 0);
+  };
   var devices = [];
   var scanned = false;
   var menuKey = "";
@@ -179,7 +182,7 @@
       }));
       if (list.length > 0) {
         setDevices(list);
-      } else {
+      } else if (r.ok) {
         slowScan();
       }
     });
@@ -265,9 +268,6 @@
     core.osd("Chromecast: connecting\u2026");
     setCasting(true);
     global.postMessage("cast:load", lastRequest);
-  }
-  function onMain(fn) {
-    setTimeout(fn, 0);
   }
   global.onMessage("cast:result", (r) => {
     onMain(() => {
