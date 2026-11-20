@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.5.6",
+    version: "0.6.0",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 19
+    ghVersion: 20
   };
 
   // src/log.ts
@@ -98,154 +98,61 @@ ${v.stack || ""}`;
     return { log: log2, safe: safe2 };
   }
 
-  // src/discover.ts
-  var { utils: utils2 } = iina;
-  var console = { log: (...a) => makeLoggerOnce()(...a) };
-  var cached = null;
-  function makeLoggerOnce() {
-    if (!cached) cached = makeLogger("scan").log;
-    return cached;
-  }
-  var DNS_SD = "/usr/bin/dns-sd";
-  var SERVICE = "_googlecast._tcp";
-  var TIMEOUT_SEC = 3;
-  var CAP = {
-    VIDEO_OUT: 1 << 0,
-    // 1
-    VIDEO_IN: 1 << 1,
-    // 2
-    AUDIO_OUT: 1 << 2,
-    // 4
-    AUDIO_IN: 1 << 3
-    // 8
-  };
-  function decodeCapabilities(ca) {
-    if (ca === void 0) return null;
-    const n = parseInt(ca, 10);
-    if (Number.isNaN(n)) return null;
-    return {
-      videoOut: (n & CAP.VIDEO_OUT) !== 0,
-      videoIn: (n & CAP.VIDEO_IN) !== 0,
-      audioOut: (n & CAP.AUDIO_OUT) !== 0,
-      audioIn: (n & CAP.AUDIO_IN) !== 0,
-      raw: n
-    };
-  }
-  function classify(md, caps) {
-    if (md && /group/i.test(md)) return "group";
-    if (caps) return caps.videoOut ? "video" : "audio";
-    return "unknown";
-  }
-  function unescapeDNSLabel(s) {
-    return s.replace(/\\(\d{3})/g, (_, d) => String.fromCharCode(parseInt(d, 10))).replace(/\\(.)/g, "$1");
-  }
-  function parseZone(stdout) {
-    const devices2 = {};
-    for (const line of stdout.split("\n")) {
-      let m = line.match(/^(\S+)\s+SRV\s+\d+\s+\d+\s+(\d+)\s+(\S+)/);
-      if (m) {
-        const d = devices2[m[1]] || (devices2[m[1]] = {});
-        d.port = parseInt(m[2], 10);
-        d.hostname = m[3].replace(/\.$/, "");
-        d.instanceName = unescapeDNSLabel(m[1].split(/(?<!\\)\./)[0]);
-        continue;
-      }
-      m = line.match(/^(\S+)\s+TXT\s+(.*)$/);
-      if (m) {
-        const d = devices2[m[1]] || (devices2[m[1]] = {});
-        const txt = d.txt || (d.txt = {});
-        const pairs = m[2].match(/"([^"]*)"/g) || [];
-        for (const raw of pairs) {
-          const kv = raw.slice(1, -1);
-          const eq = kv.indexOf("=");
-          if (eq === -1) {
-            txt[kv] = "";
-          } else {
-            txt[kv.slice(0, eq)] = kv.slice(eq + 1);
-          }
-        }
-      }
-    }
-    return devices2;
-  }
-  function parseIP(stdout) {
-    for (const line of stdout.split("\n")) {
-      if (!/\bAdd\b/.test(line)) continue;
-      const m = line.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);
-      if (m) return m[1];
-    }
-    return null;
-  }
-  async function resolveIP(hostname) {
-    try {
-      const { stdout } = await utils2.exec(DNS_SD, [
-        "-t",
-        String(TIMEOUT_SEC),
-        "-G",
-        "v4",
-        hostname
-      ]);
-      return parseIP(stdout);
-    } catch (e) {
-      console.log(`dns-sd -G failed for ${hostname}: ${e}`);
-      return null;
-    }
-  }
-  async function discoverChromecasts() {
-    let zone;
-    try {
-      const { stdout } = await utils2.exec(DNS_SD, [
-        "-t",
-        String(TIMEOUT_SEC),
-        "-Z",
-        SERVICE,
-        "local"
-      ]);
-      zone = parseZone(stdout);
-    } catch (e) {
-      console.log(`dns-sd -Z failed: ${e}`);
-      return [];
-    }
-    const entries = Object.values(zone).filter((d) => d.hostname);
-    return Promise.all(
-      entries.map(async (d) => {
-        var _a, _b, _c, _d, _e, _f, _g;
-        const txt = d.txt || {};
-        const caps = decodeCapabilities(txt["ca"]);
-        const st = parseInt((_a = txt["st"]) != null ? _a : "", 10);
-        return {
-          name: txt["fn"] || d.instanceName || d.hostname,
-          hostname: d.hostname,
-          ip: await resolveIP(d.hostname),
-          port: (_b = d.port) != null ? _b : 8009,
-          id: (_c = txt["id"]) != null ? _c : null,
-          model: (_d = txt["md"]) != null ? _d : null,
-          deviceType: classify(txt["md"], caps),
-          isActive: !Number.isNaN(st) && st !== 0,
-          statusText: (_e = txt["rs"]) != null ? _e : "",
-          version: (_f = txt["ve"]) != null ? _f : null,
-          iconPath: (_g = txt["ic"]) != null ? _g : null,
-          capabilities: caps,
-          txt
-          // raw map: anything not modeled above is still here
-        };
-      })
-    );
-  }
-
   // src/index.ts
-  var {
-    utils: utils3,
-    global,
-    mpv,
-    core,
-    event: IINAEvent,
-    menu
-  } = iina;
+  var { utils: utils2, http, file: file2, mpv, core, event: IINAEvent, menu } = iina;
   var { log, safe } = makeLogger("player");
+  var CONTROL = "http://127.0.0.1:9092";
+  var TOKEN_FILE = "@data/casthelper.token";
+  var inbox = [];
+  function readToken() {
+    try {
+      const t = file2.read(TOKEN_FILE, {});
+      return typeof t === "string" && /^[0-9a-f]{64}$/.test(t.trim()) ? t.trim() : "";
+    } catch (e) {
+      return "";
+    }
+  }
+  function ask(kind, method, path, data) {
+    const token = readToken();
+    if (!token) {
+      inbox.push({ kind, ok: false, status: 0, text: "" });
+      return;
+    }
+    const options = {
+      params: {},
+      data: data || {},
+      headers: { "Content-Type": "application/json", "X-Cast-Token": token }
+    };
+    const p = method === "get" ? http.get(`${CONTROL}${path}`, options) : http.post(`${CONTROL}${path}`, options);
+    p.then((res) => {
+      inbox.push({ kind, ok: true, status: 200, text: res && res.text || "" });
+    }).catch((e) => {
+      inbox.push({
+        kind,
+        ok: false,
+        status: e && typeof e.statusCode === "number" && e.statusCode || -1,
+        text: e && typeof e.text === "string" && e.text || ""
+      });
+    });
+  }
+  function parse(text2) {
+    try {
+      const v = JSON.parse(text2 || "{}");
+      return v && typeof v === "object" ? v : {};
+    } catch (e) {
+      return {};
+    }
+  }
   var devices = [];
   var scanned = false;
   var menuKey = "";
+  var casting = false;
+  var castConfirmed = false;
+  var wasMuted = false;
+  var lastRequest = null;
+  function disabledItem(title) {
+    return menu.item(title, null, { enabled: false });
+  }
   function rebuildMenu() {
     const key = JSON.stringify([devices, casting, scanned]);
     if (key === menuKey) return;
@@ -267,13 +174,10 @@ ${v.stack || ""}`;
     root.addSubMenuItem(
       casting ? menu.item("Stop Casting", safe("stop menu item", () => stopCasting())) : disabledItem("Stop Casting")
     );
-    root.addSubMenuItem(menu.item("Show Logs", () => utils3.open(utils3.resolvePath(LOG_DIR))));
+    root.addSubMenuItem(menu.item("Show Logs", () => utils2.open(utils2.resolvePath(LOG_DIR))));
     menu.removeAllItems();
     menu.addItem(root);
     menu.forceUpdate();
-  }
-  function disabledItem(title) {
-    return menu.item(title, null, { enabled: false });
   }
   function setDevices(list) {
     const before = JSON.stringify(devices);
@@ -283,71 +187,40 @@ ${v.stack || ""}`;
     rebuildMenu();
   }
   var ticks = 0;
-  function pollGlobal() {
+  var emptyAnswers = 0;
+  function tick() {
     ticks += 1;
-    global.postMessage("cast:poll", { devices: ticks <= 6 || ticks % 4 === 0 });
+    while (inbox.length > 0) {
+      const r = inbox.shift();
+      if (r.kind === "devices") onDevices(r);
+      else if (r.kind === "cast") onCastResult(r);
+      else if (r.kind === "toggle") onToggled(r);
+      else if (!r.ok) log(`${r.kind} failed:`, r.status, r.text.trim());
+    }
+    if (ticks <= 6 || ticks % 4 === 0) ask("devices", "get", "/devices");
   }
-  global.onMessage(
-    "cast:devices:list",
-    safe("device list", (r) => {
-      if (r.ok && r.casting === false && casting && castConfirmed) {
-        log("the helper reports the session has ended");
-        endCasting();
-        core.osd("Chromecast: casting ended");
+  function onDevices(r) {
+    if (!r.ok) {
+      emptyAnswers += 1;
+      if (emptyAnswers === 8) {
+        log("the helper is not answering:", r.status, r.text.trim());
+        setDevices([]);
       }
-      const list = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
-        name: String(d.name),
-        address: `${d.ip}:${d.port}`
-      }));
-      if (list.length > 0) {
-        setDevices(list);
-      } else if (r.ok) {
-        slowScan();
-      }
-    })
-  );
-  var slowScanRunning = false;
-  var lastSlowScan = 0;
-  function slowScan() {
-    const now = Date.now();
-    if (slowScanRunning || now - lastSlowScan < 3e4) return;
-    slowScanRunning = true;
-    lastSlowScan = now;
-    discoverChromecasts().then(
-      safe("slow scan", (found) => {
-        slowScanRunning = false;
-        setDevices(
-          found.filter((d) => d.ip).map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
-        );
-      })
-    ).catch(
-      safe("slow scan", () => {
-        slowScanRunning = false;
-        if (!scanned) setDevices([]);
-      })
-    );
+      return;
+    }
+    emptyAnswers = 0;
+    const body = parse(r.text);
+    const list = (Array.isArray(body.devices) ? body.devices : []).map((d) => ({
+      name: String(d.name),
+      address: `${d.ip}:${d.port}`
+    }));
+    if (list.length > 0 || ticks > 4) setDevices(list);
+    if (body.casting === false && casting && castConfirmed) {
+      log("the helper reports the session has ended");
+      endCasting();
+      core.osd("Chromecast: casting ended");
+    }
   }
-  IINAEvent.on("iina.window-loaded", () => {
-    log("window loaded");
-    rebuildMenu();
-    startPolling();
-  });
-  var polling = false;
-  function startPolling() {
-    if (polling) return;
-    polling = true;
-    pollGlobal();
-    setInterval(safe("poll", pollGlobal), 1e3);
-    setTimeout(
-      safe("scan fallback", () => {
-        if (!scanned) slowScan();
-      }),
-      6e3
-    );
-  }
-  var casting = false;
-  var castConfirmed = false;
-  var wasMuted = false;
   function setCasting(on) {
     casting = on;
     rebuildMenu();
@@ -381,14 +254,6 @@ ${v.stack || ""}`;
     if (/^https?:\/\//i.test(url)) return { url };
     return null;
   }
-  function numberOrZero(get) {
-    try {
-      const n = get();
-      return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
-    } catch (e) {
-      return 0;
-    }
-  }
   function tryGet(get, fallback) {
     try {
       const v = get();
@@ -396,6 +261,9 @@ ${v.stack || ""}`;
     } catch (e) {
       return fallback;
     }
+  }
+  function positive(n) {
+    return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
   }
   function castColor(c) {
     const m = /^#([0-9a-f]{2})([0-9a-f]{6})$/i.exec(c || "");
@@ -437,63 +305,73 @@ ${v.stack || ""}`;
   function castCurrent(device) {
     const url = core.status.url;
     const source = currentSource(url);
-    if (!device) {
-      core.osd("Chromecast: device address not found");
-      return;
-    }
     if (!source) {
       log(`Cannot cast this source: ${JSON.stringify(url)}`);
       core.osd(url ? "Chromecast: this source cannot be cast" : "Chromecast: no file is open");
       return;
     }
-    log("cast requested:", { device, source, title: core.status.title });
     lastRequest = {
       device,
       ...source,
       title: core.status.title || "IINA",
-      start: numberOrZero(() => mpv.getNumber("time-pos")),
-      aid: numberOrZero(() => mpv.getNumber("aid"))
+      start: positive(tryGet(() => mpv.getNumber("time-pos"), 0)),
+      aid: positive(tryGet(() => mpv.getNumber("aid"), 0))
     };
     const sub = selectedSubtitle();
     if (sub) lastRequest.sub = sub;
     log("cast request:", lastRequest);
-    sendCast();
-  }
-  var lastRequest = null;
-  function sendCast() {
-    if (!lastRequest) return;
     core.osd("Chromecast: connecting\u2026");
     beginCasting();
-    global.postMessage("cast:load", lastRequest);
+    ask("cast", "post", "/cast", lastRequest);
   }
-  global.onMessage(
-    "cast:result",
-    safe("cast result", (r) => {
-      log("cast result:", r);
-      if (!casting) return;
-      if (r.ok) castConfirmed = true;
-      else endCasting();
-      core.osd(`Chromecast: ${r.message}`);
-      if (r.needsFfmpeg) offerFfmpegInstall();
-    })
-  );
+  function onCastResult(r) {
+    const body = parse(r.text);
+    log("cast result:", r.ok ? body : { status: r.status, text: r.text.trim() });
+    if (!casting) return;
+    if (r.ok) {
+      castConfirmed = true;
+      let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
+      if (body.subs === "on") message += ", with subtitles";
+      if (body.subs === "unavailable") {
+        message += `, without subtitles (${body.subsNote || "not supported"})`;
+      }
+      core.osd(`Chromecast: ${message}`);
+      return;
+    }
+    endCasting();
+    if (r.status === 424) {
+      core.osd("Chromecast: ffmpeg is needed to convert this video");
+      offerFfmpegInstall();
+    } else if (r.status === 422) {
+      core.osd("Chromecast: cannot read this media");
+    } else if (r.status === 0) {
+      core.osd("Chromecast: the helper is not running");
+    } else {
+      core.osd(`Chromecast: failed${r.text.trim() ? `: ${r.text.trim()}` : ""}`);
+    }
+  }
   var FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html";
   function offerFfmpegInstall() {
-    const open = utils3.ask(
+    const open = utils2.ask(
       `This video has to be converted before the TV can play it, and that needs ffmpeg.
 
 Either run \u201Cbrew install ffmpeg\u201D in Terminal, or download the macOS build from ffmpeg.org, unzip it and leave the \u201Cffmpeg\u201D file in your Downloads folder. Then cast again.
 
 Open ${FFMPEG_DOWNLOAD_URL} now?`
     );
-    if (open) utils3.open(FFMPEG_DOWNLOAD_URL);
+    if (open) utils2.open(FFMPEG_DOWNLOAD_URL);
   }
   function stopCasting() {
     if (!casting) return;
     log("stop casting");
     endCasting();
-    global.postMessage("cast:stop", {});
+    ask("stop", "post", "/stop");
     core.osd("Chromecast: stopped");
+  }
+  function onToggled(r) {
+    log("toggle result:", r.ok ? parse(r.text) : { status: r.status });
+    if (!casting || !r.ok) return;
+    core.osd(parse(r.text).paused === true ? "Chromecast: paused" : "Chromecast: playing");
   }
   IINAEvent.on(
     "iina.window-will-close",
@@ -502,19 +380,14 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
       stopCasting();
     })
   );
-  IINAEvent.on("mpv.pause.changed", () => {
-    if (!casting) return;
-    if (mpv.getFlag("pause")) return;
-    log("play/pause pressed: toggling the device");
-    core.pause();
-    global.postMessage("cast:toggle", {});
-  });
-  global.onMessage(
-    "cast:toggled",
-    safe("toggle result", (r) => {
-      log("toggle result:", r);
-      if (!casting || !r.ok) return;
-      core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
+  IINAEvent.on(
+    "mpv.pause.changed",
+    safe("pause", () => {
+      if (!casting) return;
+      if (mpv.getFlag("pause")) return;
+      log("play/pause pressed: toggling the device");
+      core.pause();
+      ask("toggle", "post", "/toggle");
     })
   );
   IINAEvent.on(
@@ -523,9 +396,21 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
       if (!casting) return;
       const time = mpv.getNumber("time-pos");
       log("seek to", time);
-      global.postMessage("cast:seek", { time });
+      ask("seek", "post", "/seek", { time });
     })
   );
-  rebuildMenu();
-  startPolling();
+  IINAEvent.on(
+    "iina.window-loaded",
+    safe("window loaded", () => {
+      log("window loaded");
+      rebuildMenu();
+    })
+  );
+  setTimeout(
+    safe("start", () => {
+      rebuildMenu();
+      setInterval(safe("tick", tick), 1e3);
+    }),
+    300
+  );
 })();

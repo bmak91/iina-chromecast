@@ -86,6 +86,7 @@ func main() {
 	verbosity := flag.Int("v", lvlInfo, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
 	logPath := flag.String("log", "", "also append logs to this file (created 0600; default: stderr only)")
 	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: look in the usual install locations)")
+	tokenFile := flag.String("tokenfile", "", "write the control token to this file (0600) for the plugin's player scripts")
 	pidFile := flag.String("pidfile", "", "record this helper's process id here and replace an older helper found through it")
 	ffmpegDirs := flag.String("ffmpeg-dirs", "", "colon-separated extra folders to look for a manually downloaded ffmpeg")
 	flag.Parse()
@@ -167,6 +168,17 @@ func main() {
 
 	// Signal the plugin (which reads our stdout) that we're up, and hand it the
 	// secret it must present on every control request.
+	if *tokenFile != "" {
+		// Replace rather than rewrite, so a reader never sees half a token and
+		// the file is private from the moment it exists.
+		tmp := *tokenFile + ".tmp"
+		_ = os.Remove(tmp)
+		if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
+			logError("cannot write token file: %v", err)
+		} else if err := os.Rename(tmp, *tokenFile); err != nil {
+			logError("cannot write token file: %v", err)
+		}
+	}
 	fmt.Printf("READY %s\n", token)
 	logInfo("wrote READY to stdout; waiting for control requests")
 

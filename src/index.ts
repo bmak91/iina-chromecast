@@ -1,33 +1,94 @@
-import { discoverChromecasts } from "./discover";
 import { makeLogger, LOG_DIR } from "./log";
 
-const {
-  utils,
-  global,
-  mpv,
-  core,
-  event: IINAEvent,
-  menu,
-} = iina;
-
+const { utils, http, file, mpv, core, event: IINAEvent, menu } = iina;
 const { log, safe } = makeLogger("player");
 
-// Everything from the plugin's global script arrives as the direct answer to
-// this window's own poll (see pollGlobal), so handlers always run on the main
-// thread while this instance is alive. Nothing is delivered to it later from
-// another thread; that crashed IINA when the plugin was updated mid-flight.
+// --- How this script stays safe -----------------------------------------------
+//
+// IINA runs network callbacks on background threads, and it can replace this
+// script's plugin instance (on update or reload) at any moment. Calling an
+// iina.* API from a background thread, from a callback that outlives the
+// instance, or across instances (player <-> global messages) crashes IINA.
+//
+// So this script talks to the helper directly over HTTP and follows two rules:
+//
+//   1. A network callback only pushes a plain object onto `inbox`.
+//   2. Everything else happens in the one-second timer (`tick`), in menu
+//      actions and in IINA events: on the main thread, in an instance that is
+//      alive (IINA removes an instance's timers and listeners when it goes).
+//
+// There are no messages between this script and the global script at all.
+
+const CONTROL = "http://127.0.0.1:9092";
+const TOKEN_FILE = "@data/casthelper.token";
+
+type Reply = { kind: string; ok: boolean; status: number; text: string };
+const inbox: Reply[] = [];
+
+function readToken(): string {
+  try {
+    const t = file.read(TOKEN_FILE, {});
+    return typeof t === "string" && /^[0-9a-f]{64}$/.test(t.trim()) ? t.trim() : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// Sends a request to the helper. The answer shows up in `inbox` and is handled
+// by the next tick.
+function ask(kind: string, method: "get" | "post", path: string, data?: Record<string, any>) {
+  const token = readToken();
+  if (!token) {
+    inbox.push({ kind, ok: false, status: 0, text: "" });
+    return;
+  }
+  const options = {
+    params: {},
+    data: data || {},
+    headers: { "Content-Type": "application/json", "X-Cast-Token": token },
+  };
+  const p = method === "get" ? http.get(`${CONTROL}${path}`, options) : http.post(`${CONTROL}${path}`, options);
+  p.then((res: any) => {
+    inbox.push({ kind, ok: true, status: 200, text: (res && res.text) || "" });
+  }).catch((e: any) => {
+    inbox.push({
+      kind,
+      ok: false,
+      status: (e && typeof e.statusCode === "number" && e.statusCode) || -1,
+      text: (e && typeof e.text === "string" && e.text) || "",
+    });
+  });
+}
+
+function parse(text: string): Record<string, any> {
+  try {
+    const v = JSON.parse(text || "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch (e) {
+    return {};
+  }
+}
 
 // --- Devices and menu --------------------------------------------------------
-//
-// The helper keeps a live list of Cast devices (it asks the network directly,
-// which takes a fraction of a second). The plugin polls that list and only
-// falls back to the slow dns-sd scan when the helper has nothing to offer.
 
 type Device = { name: string; address: string };
 
 let devices: Device[] = [];
-let scanned = false; // has any scan finished yet?
+let scanned = false; // has the helper answered with a device list yet?
 let menuKey = "";
+
+// While casting, IINA is only the remote control: the local player stays
+// paused and muted, and play/pause and seeking are sent to the device.
+let casting = false;
+let castConfirmed = false; // the device accepted the media
+let wasMuted = false;
+let lastRequest: Record<string, any> | null = null;
+
+// macOS enables every submenu item that has an action, whatever its "enabled"
+// flag says. An item only shows as greyed out when it has no action at all.
+function disabledItem(title: string) {
+  return menu.item(title, null as any, { enabled: false });
+}
 
 function rebuildMenu() {
   const key = JSON.stringify([devices, casting, scanned]);
@@ -52,18 +113,11 @@ function rebuildMenu() {
       ? menu.item("Stop Casting", safe("stop menu item", () => stopCasting()))
       : disabledItem("Stop Casting")
   );
-
   root.addSubMenuItem(menu.item("Show Logs", () => utils.open(utils.resolvePath(LOG_DIR))));
 
   menu.removeAllItems();
   menu.addItem(root);
   menu.forceUpdate();
-}
-
-// macOS enables every submenu item that has an action, whatever its "enabled"
-// flag says. An item only shows as greyed out when it has no action at all.
-function disabledItem(title: string) {
-  return menu.item(title, null as any, { enabled: false });
 }
 
 function setDevices(list: Device[]) {
@@ -76,90 +130,57 @@ function setDevices(list: Device[]) {
   rebuildMenu();
 }
 
-// Ask the global script for anything it has for this window. Results of cast
-// requests are collected every second, the device list every few seconds
-// (every second at first, so the menu fills in quickly).
+// --- The tick ------------------------------------------------------------------
+
 let ticks = 0;
-function pollGlobal() {
+let emptyAnswers = 0;
+
+function tick() {
   ticks += 1;
-  global.postMessage("cast:poll", { devices: ticks <= 6 || ticks % 4 === 0 });
+
+  // 1. Handle whatever came back from the helper since the last tick.
+  while (inbox.length > 0) {
+    const r = inbox.shift() as Reply;
+    if (r.kind === "devices") onDevices(r);
+    else if (r.kind === "cast") onCastResult(r);
+    else if (r.kind === "toggle") onToggled(r);
+    else if (!r.ok) log(`${r.kind} failed:`, r.status, r.text.trim());
+  }
+
+  // 2. Ask for the device list: every second at first so the menu fills in
+  //    quickly, then every four seconds.
+  if (ticks <= 6 || ticks % 4 === 0) ask("devices", "get", "/devices");
 }
 
-global.onMessage(
-  "cast:devices:list",
-  safe("device list", (r: { ok: boolean; devices?: any[]; casting?: boolean }) => {
-    // The session ended on the device (stopped with the TV remote, TV off...).
-    if (r.ok && r.casting === false && casting && castConfirmed) {
-      log("the helper reports the session has ended");
-      endCasting();
-      core.osd("Chromecast: casting ended");
+function onDevices(r: Reply) {
+  if (!r.ok) {
+    // The helper is not up (yet). After a while, say so in the menu.
+    emptyAnswers += 1;
+    if (emptyAnswers === 8) {
+      log("the helper is not answering:", r.status, r.text.trim());
+      setDevices([]);
     }
-    const list: Device[] = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
-      name: String(d.name),
-      address: `${d.ip}:${d.port}`,
-    }));
-    if (list.length > 0) {
-      setDevices(list);
-    } else if (r.ok) {
-      slowScan(); // the helper is up but sees nothing: try the old scan
-    }
-    // Not ok: the helper is still starting. The next poll asks again.
-  })
-);
+    return;
+  }
+  emptyAnswers = 0;
+  const body = parse(r.text);
+  const list: Device[] = (Array.isArray(body.devices) ? body.devices : []).map((d: any) => ({
+    name: String(d.name),
+    address: `${d.ip}:${d.port}`,
+  }));
+  // The first answers can come before any device has replied; don't flash
+  // "No Devices Found" during the first seconds.
+  if (list.length > 0 || ticks > 4) setDevices(list);
 
-// Fallback: the original dns-sd based scan. It takes several seconds, so it
-// runs at most every 30 seconds and never twice at once.
-let slowScanRunning = false;
-let lastSlowScan = 0;
-
-function slowScan() {
-  const now = Date.now();
-  if (slowScanRunning || now - lastSlowScan < 30000) return;
-  slowScanRunning = true;
-  lastSlowScan = now;
-  discoverChromecasts()
-    .then(
-      safe("slow scan", (found) => {
-        slowScanRunning = false;
-        setDevices(
-          found
-            .filter((d) => d.ip)
-            .map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
-        );
-      })
-    )
-    .catch(
-      safe("slow scan", () => {
-        slowScanRunning = false;
-        if (!scanned) setDevices([]);
-      })
-    );
+  // The session ended on the device (stopped with the TV remote, TV off...).
+  if (body.casting === false && casting && castConfirmed) {
+    log("the helper reports the session has ended");
+    endCasting();
+    core.osd("Chromecast: casting ended");
+  }
 }
 
-IINAEvent.on("iina.window-loaded", () => {
-  log("window loaded");
-  rebuildMenu();
-  startPolling();
-});
-
-let polling = false;
-function startPolling() {
-  if (polling) return;
-  polling = true;
-  pollGlobal();
-  setInterval(safe("poll", pollGlobal), 1000);
-  // If the helper never answers, don't sit on "Scanning..." forever.
-  setTimeout(
-    safe("scan fallback", () => {
-      if (!scanned) slowScan();
-    }),
-    6000
-  );
-}
-
-let casting = false;
-let castConfirmed = false; // the device accepted the media
-let wasMuted = false;
+// --- Casting -----------------------------------------------------------------
 
 function setCasting(on: boolean) {
   casting = on;
@@ -199,15 +220,6 @@ function currentSource(url: string | undefined | null): { path?: string; url?: s
   return null;
 }
 
-function numberOrZero(get: () => number): number {
-  try {
-    const n = get();
-    return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
-  } catch (e) {
-    return 0;
-  }
-}
-
 function tryGet<T>(get: () => T, fallback: T): T {
   try {
     const v = get();
@@ -215,6 +227,10 @@ function tryGet<T>(get: () => T, fallback: T): T {
   } catch (e) {
     return fallback;
   }
+}
+
+function positive(n: number): number {
+  return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
 }
 
 // mpv prints colours as #AARRGGBB; Cast wants #RRGGBBAA.
@@ -263,53 +279,55 @@ function selectedSubtitle(): Record<string, any> | null {
   return sub;
 }
 
-function castCurrent(device: string | null) {
+function castCurrent(device: string) {
   const url = core.status.url;
   const source = currentSource(url);
-  if (!device) {
-    core.osd("Chromecast: device address not found");
-    return;
-  }
   if (!source) {
     log(`Cannot cast this source: ${JSON.stringify(url)}`);
     core.osd(url ? "Chromecast: this source cannot be cast" : "Chromecast: no file is open");
     return;
   }
-  log("cast requested:", { device, source, title: core.status.title });
   lastRequest = {
     device,
     ...source,
     title: core.status.title || "IINA",
-    start: numberOrZero(() => mpv.getNumber("time-pos")),
-    aid: numberOrZero(() => mpv.getNumber("aid")),
+    start: positive(tryGet(() => mpv.getNumber("time-pos"), 0)),
+    aid: positive(tryGet(() => mpv.getNumber("aid"), 0)),
   };
   const sub = selectedSubtitle();
   if (sub) lastRequest.sub = sub;
   log("cast request:", lastRequest);
-  sendCast();
-}
-
-let lastRequest: Record<string, any> | null = null;
-
-function sendCast() {
-  if (!lastRequest) return;
   core.osd("Chromecast: connecting…");
   beginCasting();
-  global.postMessage("cast:load", lastRequest);
+  ask("cast", "post", "/cast", lastRequest);
 }
 
-// The global entry reports how the cast request went.
-global.onMessage(
-  "cast:result",
-  safe("cast result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
-    log("cast result:", r);
-    if (!casting) return;
-    if (r.ok) castConfirmed = true;
-    else endCasting();
-    core.osd(`Chromecast: ${r.message}`);
-    if (r.needsFfmpeg) offerFfmpegInstall();
-  })
-);
+function onCastResult(r: Reply) {
+  const body = parse(r.text);
+  log("cast result:", r.ok ? body : { status: r.status, text: r.text.trim() });
+  if (!casting) return;
+  if (r.ok) {
+    castConfirmed = true;
+    let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
+    if (body.subs === "on") message += ", with subtitles";
+    if (body.subs === "unavailable") {
+      message += `, without subtitles (${body.subsNote || "not supported"})`;
+    }
+    core.osd(`Chromecast: ${message}`);
+    return;
+  }
+  endCasting();
+  if (r.status === 424) {
+    core.osd("Chromecast: ffmpeg is needed to convert this video");
+    offerFfmpegInstall();
+  } else if (r.status === 422) {
+    core.osd("Chromecast: cannot read this media");
+  } else if (r.status === 0) {
+    core.osd("Chromecast: the helper is not running");
+  } else {
+    core.osd(`Chromecast: failed${r.text.trim() ? `: ${r.text.trim()}` : ""}`);
+  }
+}
 
 // ffmpeg does the conversion. If it is missing, say how to get it and offer to
 // open its download page. The helper also looks for a downloaded "ffmpeg" in
@@ -331,9 +349,17 @@ function stopCasting() {
   if (!casting) return;
   log("stop casting");
   endCasting();
-  global.postMessage("cast:stop", {});
+  ask("stop", "post", "/stop");
   core.osd("Chromecast: stopped");
 }
+
+function onToggled(r: Reply) {
+  log("toggle result:", r.ok ? parse(r.text) : { status: r.status });
+  if (!casting || !r.ok) return;
+  core.osd(parse(r.text).paused === true ? "Chromecast: paused" : "Chromecast: playing");
+}
+
+// --- IINA events ---------------------------------------------------------------
 
 // Don't leave the file being served once the window that cast it is gone.
 IINAEvent.on(
@@ -345,23 +371,17 @@ IINAEvent.on(
 );
 
 // Pressing play/pause in IINA toggles playback on the device. The local player
-// is put straight back to paused, so nothing plays on the Mac.
-IINAEvent.on("mpv.pause.changed", () => {
-  if (!casting) return;
-  if (mpv.getFlag("pause")) return; // our own pause, nothing to do
-  log("play/pause pressed: toggling the device");
-  core.pause();
-  // The helper knows the device's real state (it may have been paused with
-  // the TV remote), so it decides which way to toggle and reports back.
-  global.postMessage("cast:toggle", {});
-});
-
-global.onMessage(
-  "cast:toggled",
-  safe("toggle result", (r: { ok: boolean; paused?: boolean }) => {
-    log("toggle result:", r);
-    if (!casting || !r.ok) return;
-    core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
+// is put straight back to paused, so nothing plays on the Mac. The helper knows
+// the device's real state (it may have been paused with the TV remote), so it
+// decides which way to toggle.
+IINAEvent.on(
+  "mpv.pause.changed",
+  safe("pause", () => {
+    if (!casting) return;
+    if (mpv.getFlag("pause")) return; // our own pause, nothing to do
+    log("play/pause pressed: toggling the device");
+    core.pause();
+    ask("toggle", "post", "/toggle");
   })
 );
 
@@ -371,12 +391,24 @@ IINAEvent.on(
     if (!casting) return;
     const time = mpv.getNumber("time-pos");
     log("seek to", time);
-    global.postMessage("cast:seek", { time });
+    ask("seek", "post", "/seek", { time });
   })
 );
 
-// After a plugin update or reload the window is already open and no
-// "window-loaded" event comes, so start right away as well. (This is at the
-// end of the file because it uses the state declared above.)
-rebuildMenu();
-startPolling();
+IINAEvent.on(
+  "iina.window-loaded",
+  safe("window loaded", () => {
+    log("window loaded");
+    rebuildMenu();
+  })
+);
+
+// Start a moment after loading rather than during it: while IINA is still
+// constructing this instance, very little is safe to call.
+setTimeout(
+  safe("start", () => {
+    rebuildMenu();
+    setInterval(safe("tick", tick), 1000);
+  }),
+  300
+);

@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: 7d304f329ff4e979cbde9900aaeaa1e809447f383a0089dd529f0ad8b2fdb5a9
+# expected: abf48b12c5b4dbbe9e4ada5a98a74e7ccdda20d15c5213dfa0d733b0028bdb50
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -46,14 +46,17 @@ To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
 
 ## How it works
 
-- `src/index.ts` (per player window) adds a *Chromecast* entry to the plugin menu and
-  keeps it in sync with the helper's device list. *Stop Casting* is enabled only
-  while casting.
-- Discovery: the helper sends one multicast DNS question for Cast devices and reads
-  the answers itself, so devices show up in well under a second. The original
-  `/usr/bin/dns-sd` scan (several seconds per run) remains as a fallback.
-- `src/global.ts` starts `casthelper` once and relays commands to it.
-- `go-casthelper/` speaks the Cast protocol and serves the media to the device over HTTP.
+- `src/global.ts` starts `casthelper` once per IINA launch. That is all it does.
+- `src/index.ts` (one per player window) adds the *Chromecast* menu and talks to the
+  helper directly over HTTP on localhost, using the access token the helper writes to
+  a private file in the plugin's data folder.
+- `go-casthelper/` finds devices (one multicast DNS question, answers parsed directly),
+  speaks the Cast protocol and serves the media to the device over HTTP.
+
+The plugin's scripts follow two rules, because breaking either crashes IINA: network
+callbacks only store their result in a variable, and everything that touches IINA runs
+from a one-second timer, a menu action or an IINA event on the main thread. There are
+no messages between the plugin's global script and its player scripts.
 
 ### Conversion
 
