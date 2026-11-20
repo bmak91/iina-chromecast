@@ -198,9 +198,12 @@
           found.filter((d) => d.ip).map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
         );
       })
-    ).catch(() => {
-      slowScanRunning = false;
-    });
+    ).catch(
+      () => onMain(() => {
+        slowScanRunning = false;
+        if (!scanned) setDevices([]);
+      })
+    );
   }
   IINAEvent.on("iina.window-loaded", () => {
     rebuildMenu();
@@ -208,6 +211,9 @@
     setTimeout(refreshDevices, 800);
     setTimeout(refreshDevices, 2500);
     setInterval(refreshDevices, 5e3);
+    setTimeout(() => {
+      if (!scanned) slowScan();
+    }, 4e3);
   });
   var casting = false;
   function setCasting(on) {

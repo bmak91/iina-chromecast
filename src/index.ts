@@ -93,9 +93,12 @@ function slowScan() {
         );
       })
     )
-    .catch(() => {
-      slowScanRunning = false;
-    });
+    .catch(() =>
+      onMain(() => {
+        slowScanRunning = false;
+        if (!scanned) setDevices([]);
+      })
+    );
 }
 
 IINAEvent.on("iina.window-loaded", () => {
@@ -105,6 +108,10 @@ IINAEvent.on("iina.window-loaded", () => {
   setTimeout(refreshDevices, 800);
   setTimeout(refreshDevices, 2500);
   setInterval(refreshDevices, 5000);
+  // If the helper never answers, don't sit on "Scanning..." forever.
+  setTimeout(() => {
+    if (!scanned) slowScan();
+  }, 4000);
 });
 
 let casting = false;
