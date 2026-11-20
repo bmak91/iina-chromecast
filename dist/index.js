@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.5.5",
+    version: "0.5.6",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 18
+    ghVersion: 19
   };
 
   // src/log.ts
@@ -243,9 +243,6 @@ ${v.stack || ""}`;
     menu
   } = iina;
   var { log, safe } = makeLogger("player");
-  var onMain = (fn) => {
-    setTimeout(safe("callback", fn), 0);
-  };
   var devices = [];
   var scanned = false;
   var menuKey = "";
@@ -285,11 +282,14 @@ ${v.stack || ""}`;
     scanned = true;
     rebuildMenu();
   }
-  function refreshDevices() {
-    global.postMessage("cast:devices", {});
+  var ticks = 0;
+  function pollGlobal() {
+    ticks += 1;
+    global.postMessage("cast:poll", { devices: ticks <= 6 || ticks % 4 === 0 });
   }
-  global.onMessage("cast:devices:list", (r) => {
-    onMain(() => {
+  global.onMessage(
+    "cast:devices:list",
+    safe("device list", (r) => {
       if (r.ok && r.casting === false && casting && castConfirmed) {
         log("the helper reports the session has ended");
         endCasting();
@@ -304,8 +304,8 @@ ${v.stack || ""}`;
       } else if (r.ok) {
         slowScan();
       }
-    });
-  });
+    })
+  );
   var slowScanRunning = false;
   var lastSlowScan = 0;
   function slowScan() {
@@ -314,14 +314,14 @@ ${v.stack || ""}`;
     slowScanRunning = true;
     lastSlowScan = now;
     discoverChromecasts().then(
-      (found) => onMain(() => {
+      safe("slow scan", (found) => {
         slowScanRunning = false;
         setDevices(
           found.filter((d) => d.ip).map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
         );
       })
     ).catch(
-      () => onMain(() => {
+      safe("slow scan", () => {
         slowScanRunning = false;
         if (!scanned) setDevices([]);
       })
@@ -330,14 +330,21 @@ ${v.stack || ""}`;
   IINAEvent.on("iina.window-loaded", () => {
     log("window loaded");
     rebuildMenu();
-    refreshDevices();
-    setTimeout(refreshDevices, 800);
-    setTimeout(refreshDevices, 2500);
-    setInterval(refreshDevices, 5e3);
-    setTimeout(() => {
-      if (!scanned) slowScan();
-    }, 4e3);
+    startPolling();
   });
+  var polling = false;
+  function startPolling() {
+    if (polling) return;
+    polling = true;
+    pollGlobal();
+    setInterval(safe("poll", pollGlobal), 1e3);
+    setTimeout(
+      safe("scan fallback", () => {
+        if (!scanned) slowScan();
+      }),
+      6e3
+    );
+  }
   var casting = false;
   var castConfirmed = false;
   var wasMuted = false;
@@ -459,16 +466,17 @@ ${v.stack || ""}`;
     beginCasting();
     global.postMessage("cast:load", lastRequest);
   }
-  global.onMessage("cast:result", (r) => {
-    onMain(() => {
+  global.onMessage(
+    "cast:result",
+    safe("cast result", (r) => {
       log("cast result:", r);
       if (!casting) return;
       if (r.ok) castConfirmed = true;
       else endCasting();
       core.osd(`Chromecast: ${r.message}`);
       if (r.needsFfmpeg) offerFfmpegInstall();
-    });
-  });
+    })
+  );
   var FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html";
   function offerFfmpegInstall() {
     const open = utils3.ask(
@@ -501,12 +509,14 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
     core.pause();
     global.postMessage("cast:toggle", {});
   });
-  global.onMessage("cast:toggled", (r) => {
-    onMain(() => {
+  global.onMessage(
+    "cast:toggled",
+    safe("toggle result", (r) => {
+      log("toggle result:", r);
       if (!casting || !r.ok) return;
       core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
-    });
-  });
+    })
+  );
   IINAEvent.on(
     "mpv.seek",
     safe("seek", () => {
@@ -516,4 +526,6 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
       global.postMessage("cast:seek", { time });
     })
   );
+  rebuildMenu();
+  startPolling();
 })();

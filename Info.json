@@ -1,7 +1,7 @@
 {
   "name": "IINA Chromecast",
   "identifier": "com.bmak91.iina-chromecast",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "Chromecast support for IINA",
   "author": {
     "name": "Deepak Mittal",
@@ -20,5 +20,5 @@
     "127.0.0.1"
   ],
   "ghRepo": "bmak91/iina-chromecast",
-  "ghVersion": 18
+  "ghVersion": 19
 }

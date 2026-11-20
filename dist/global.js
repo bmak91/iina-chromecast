@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.5.5",
+    version: "0.5.6",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 18
+    ghVersion: 19
   };
 
   // src/log.ts
@@ -117,6 +117,7 @@ ${v.stack || ""}`;
   var CONTROL = "http://127.0.0.1:9092";
   var token = null;
   var stdoutBuf = "";
+  var notes = [];
   function onHelperStdout(out) {
     if (token) return;
     stdoutBuf = (stdoutBuf + out).slice(-4096);
@@ -124,26 +125,27 @@ ${v.stack || ""}`;
     if (m) {
       token = m[1];
       stdoutBuf = "";
-      log("casthelper is up");
+      notes.push("casthelper is up");
     }
   }
-  function post(path, data) {
-    if (!token) {
-      log(`casthelper not ready, dropping ${path}`);
-      return Promise.reject({ statusCode: 0, text: "helper is not running" });
-    }
-    return http.post(`${CONTROL}${path}`, {
+  function flushNotes() {
+    while (notes.length > 0) log(notes.shift());
+  }
+  function request(method, path, data) {
+    if (!token) return Promise.reject({ statusCode: 0, text: "helper is not running" });
+    const options = {
       params: {},
       data: data || {},
-      headers: {
-        "Content-Type": "application/json",
-        "X-Cast-Token": token
-      }
-    });
+      headers: { "Content-Type": "application/json", "X-Cast-Token": token }
+    };
+    return method === "get" ? http.get(`${CONTROL}${path}`, options) : http.post(`${CONTROL}${path}`, options);
   }
-  function quiet(path, data) {
-    log("command", path, data || "");
-    post(path, data).catch((e) => log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
+  function parse(res) {
+    try {
+      return JSON.parse(res && res.text || "{}");
+    } catch (e) {
+      return {};
+    }
   }
   function failureMessage(e) {
     const status = e && e.statusCode;
@@ -153,61 +155,87 @@ ${v.stack || ""}`;
     const text2 = e && typeof e.text === "string" ? e.text.trim() : "";
     return text2 ? `failed: ${text2}` : "failed";
   }
-  function toPlayer(player, name, data) {
+  var outbox = {};
+  function queue(player, name, data) {
     if (!player) return;
-    setTimeout(() => global.postMessage(player, name, data), 0);
+    (outbox[player] = outbox[player] || []).push({ name, data });
   }
-  function load(d, player) {
-    log("cast request from player", player, { device: d.device, path: d.path, url: d.url, start: d.start });
-    const reply = (r) => toPlayer(player, "cast:result", r);
-    post("/cast", d).then((res) => {
-      let body = {};
-      try {
-        body = JSON.parse(res && res.text || "{}");
-      } catch (e) {
-      }
-      let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
-      if (body.subs === "on") message += ", with subtitles";
-      if (body.subs === "unavailable") {
-        message += `, without subtitles (${body.subsNote || "not supported"})`;
-      }
-      log("cast accepted:", body);
-      reply({ ok: true, message });
-    }).catch((e) => {
-      log(`casthelper /cast failed: ${JSON.stringify(e)}`);
-      reply({ ok: false, message: failureMessage(e), needsFfmpeg: !!e && e.statusCode === 424 });
-    });
-  }
-  global.onMessage("cast:load", safe("cast:load", (d, player) => load(d, player)));
-  global.onMessage("cast:devices", (_d, player) => {
-    if (!player) return;
-    const reply = (r) => toPlayer(player, "cast:devices:list", r);
+  var devices = { ok: false };
+  var refreshing = false;
+  function refreshDevices() {
+    if (refreshing) return;
     if (!token) {
-      reply({ ok: false });
+      devices = { ok: false };
       return;
     }
-    http.get(`${CONTROL}/devices`, { params: {}, headers: { "X-Cast-Token": token }, data: {} }).then((res) => {
-      const body = JSON.parse(res && res.text || "{}");
-      reply({
+    refreshing = true;
+    request("get", "/devices").then((res) => {
+      const body = parse(res);
+      devices = {
         ok: true,
         devices: Array.isArray(body.devices) ? body.devices : [],
         casting: body.casting === true
-      });
-    }).catch(() => reply({ ok: false }));
-  });
-  global.onMessage("cast:toggle", (_d, player) => {
-    post("/toggle").then((res) => {
-      const paused = /"paused":\s*true/.test(res && res.text || "");
-      toPlayer(player, "cast:toggled", { ok: true, paused });
-    }).catch((e) => {
-      log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
-      toPlayer(player, "cast:toggled", { ok: false });
+      };
+      refreshing = false;
+    }).catch(() => {
+      devices = { ok: false };
+      refreshing = false;
     });
-  });
-  global.onMessage("cast:pause", () => quiet("/pause"));
-  global.onMessage("cast:play", () => quiet("/play"));
-  global.onMessage("cast:seek", (d) => quiet("/seek", d));
-  global.onMessage("cast:stop", () => quiet("/stop"));
+  }
+  global.onMessage(
+    "cast:poll",
+    safe("cast:poll", (d, player) => {
+      if (!player) return;
+      flushNotes();
+      const waiting = outbox[player];
+      if (waiting && waiting.length > 0) {
+        outbox[player] = [];
+        for (const m of waiting) global.postMessage(player, m.name, m.data);
+      }
+      if (d && d.devices) {
+        global.postMessage(player, "cast:devices:list", devices);
+        refreshDevices();
+      }
+    })
+  );
+  global.onMessage(
+    "cast:load",
+    safe("cast:load", (d, player) => {
+      log("cast request from player", player, { device: d.device, path: d.path, url: d.url, start: d.start });
+      request("post", "/cast", d).then((res) => {
+        const body = parse(res);
+        let message = body.mode === "convert" ? "casting (converting on the fly)" : "casting";
+        if (body.subs === "on") message += ", with subtitles";
+        if (body.subs === "unavailable") {
+          message += `, without subtitles (${body.subsNote || "not supported"})`;
+        }
+        queue(player, "cast:result", { ok: true, message, detail: body });
+      }).catch((e) => {
+        queue(player, "cast:result", {
+          ok: false,
+          message: failureMessage(e),
+          needsFfmpeg: !!e && e.statusCode === 424,
+          detail: e
+        });
+      });
+    })
+  );
+  global.onMessage(
+    "cast:toggle",
+    safe("cast:toggle", (_d, player) => {
+      request("post", "/toggle").then((res) => queue(player, "cast:toggled", { ok: true, paused: parse(res).paused === true })).catch((e) => queue(player, "cast:toggled", { ok: false, detail: e }));
+    })
+  );
+  function command(path) {
+    return safe(path, (d) => {
+      log("command", path, d || "");
+      request("post", path, d && Object.keys(d).length ? d : void 0).catch(() => void 0);
+    });
+  }
+  global.onMessage("cast:pause", command("/pause"));
+  global.onMessage("cast:play", command("/play"));
+  global.onMessage("cast:seek", command("/seek"));
+  global.onMessage("cast:stop", command("/stop"));
   if (!bin) {
     log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
   } else {
@@ -239,6 +267,11 @@ ${v.stack || ""}`;
       ],
       void 0,
       onHelperStdout
-    ).then((r) => log(`casthelper exited with status ${r.status}`, (r.stderr || "").slice(-1500))).catch((e) => log(`casthelper failed to start: ${e}`));
+    ).then((r) => {
+      token = null;
+      notes.push(`casthelper exited with status ${r.status} ${(r.stderr || "").slice(-800)}`);
+    }).catch((e) => {
+      notes.push(`casthelper failed to start: ${e}`);
+    });
   }
 })();

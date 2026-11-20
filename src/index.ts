@@ -12,11 +12,10 @@ const {
 
 const { log, safe } = makeLogger("player");
 
-// Messages and promise callbacks can arrive on a background thread, where
-// touching the UI crashes or hangs IINA. Timers always fire on the main thread.
-const onMain = (fn: () => void) => {
-  setTimeout(safe("callback", fn), 0);
-};
+// Everything from the plugin's global script arrives as the direct answer to
+// this window's own poll (see pollGlobal), so handlers always run on the main
+// thread while this instance is alive. Nothing is delivered to it later from
+// another thread; that crashed IINA when the plugin was updated mid-flight.
 
 // --- Devices and menu --------------------------------------------------------
 //
@@ -77,12 +76,18 @@ function setDevices(list: Device[]) {
   rebuildMenu();
 }
 
-function refreshDevices() {
-  global.postMessage("cast:devices", {});
+// Ask the global script for anything it has for this window. Results of cast
+// requests are collected every second, the device list every few seconds
+// (every second at first, so the menu fills in quickly).
+let ticks = 0;
+function pollGlobal() {
+  ticks += 1;
+  global.postMessage("cast:poll", { devices: ticks <= 6 || ticks % 4 === 0 });
 }
 
-global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[]; casting?: boolean }) => {
-  onMain(() => {
+global.onMessage(
+  "cast:devices:list",
+  safe("device list", (r: { ok: boolean; devices?: any[]; casting?: boolean }) => {
     // The session ended on the device (stopped with the TV remote, TV off...).
     if (r.ok && r.casting === false && casting && castConfirmed) {
       log("the helper reports the session has ended");
@@ -99,8 +104,8 @@ global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[]; castin
       slowScan(); // the helper is up but sees nothing: try the old scan
     }
     // Not ok: the helper is still starting. The next poll asks again.
-  });
-});
+  })
+);
 
 // Fallback: the original dns-sd based scan. It takes several seconds, so it
 // runs at most every 30 seconds and never twice at once.
@@ -113,8 +118,8 @@ function slowScan() {
   slowScanRunning = true;
   lastSlowScan = now;
   discoverChromecasts()
-    .then((found) =>
-      onMain(() => {
+    .then(
+      safe("slow scan", (found) => {
         slowScanRunning = false;
         setDevices(
           found
@@ -123,8 +128,8 @@ function slowScan() {
         );
       })
     )
-    .catch(() =>
-      onMain(() => {
+    .catch(
+      safe("slow scan", () => {
         slowScanRunning = false;
         if (!scanned) setDevices([]);
       })
@@ -134,19 +139,24 @@ function slowScan() {
 IINAEvent.on("iina.window-loaded", () => {
   log("window loaded");
   rebuildMenu();
-  refreshDevices();
-  // The helper may still be starting; ask again shortly, then keep polling.
-  setTimeout(refreshDevices, 800);
-  setTimeout(refreshDevices, 2500);
-  setInterval(refreshDevices, 5000);
-  // If the helper never answers, don't sit on "Scanning..." forever.
-  setTimeout(() => {
-    if (!scanned) slowScan();
-  }, 4000);
+  startPolling();
 });
 
-// While casting, IINA is only the remote control: the local player stays
-// paused and muted, and play/pause and seeking are sent to the device.
+let polling = false;
+function startPolling() {
+  if (polling) return;
+  polling = true;
+  pollGlobal();
+  setInterval(safe("poll", pollGlobal), 1000);
+  // If the helper never answers, don't sit on "Scanning..." forever.
+  setTimeout(
+    safe("scan fallback", () => {
+      if (!scanned) slowScan();
+    }),
+    6000
+  );
+}
+
 let casting = false;
 let castConfirmed = false; // the device accepted the media
 let wasMuted = false;
@@ -289,16 +299,17 @@ function sendCast() {
 }
 
 // The global entry reports how the cast request went.
-global.onMessage("cast:result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
-  onMain(() => {
+global.onMessage(
+  "cast:result",
+  safe("cast result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
     log("cast result:", r);
     if (!casting) return;
     if (r.ok) castConfirmed = true;
     else endCasting();
     core.osd(`Chromecast: ${r.message}`);
     if (r.needsFfmpeg) offerFfmpegInstall();
-  });
-});
+  })
+);
 
 // ffmpeg does the conversion. If it is missing, say how to get it and offer to
 // open its download page. The helper also looks for a downloaded "ffmpeg" in
@@ -345,12 +356,14 @@ IINAEvent.on("mpv.pause.changed", () => {
   global.postMessage("cast:toggle", {});
 });
 
-global.onMessage("cast:toggled", (r: { ok: boolean; paused?: boolean }) => {
-  onMain(() => {
+global.onMessage(
+  "cast:toggled",
+  safe("toggle result", (r: { ok: boolean; paused?: boolean }) => {
+    log("toggle result:", r);
     if (!casting || !r.ok) return;
     core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
-  });
-});
+  })
+);
 
 IINAEvent.on(
   "mpv.seek",
@@ -361,3 +374,9 @@ IINAEvent.on(
     global.postMessage("cast:seek", { time });
   })
 );
+
+// After a plugin update or reload the window is already open and no
+// "window-loaded" event comes, so start right away as well. (This is at the
+// end of the file because it uses the state declared above.)
+rebuildMenu();
+startPolling();
