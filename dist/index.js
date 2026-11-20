@@ -243,11 +243,16 @@
     casting = true;
     global.postMessage("cast:load", lastRequest);
   }
+  function onMain(fn) {
+    setTimeout(fn, 0);
+  }
   global.onMessage("cast:result", (r) => {
-    if (!casting) return;
-    if (!r.ok) casting = false;
-    core.osd(`Chromecast: ${r.message}`);
-    if (r.needsFfmpeg) offerFfmpegInstall();
+    onMain(() => {
+      if (!casting) return;
+      if (!r.ok) casting = false;
+      core.osd(`Chromecast: ${r.message}`);
+      if (r.needsFfmpeg) offerFfmpegInstall();
+    });
   });
   var BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
   var installingFfmpeg = false;
@@ -277,20 +282,24 @@
       brew,
       "install",
       "ffmpeg"
-    ]).then((res) => {
-      installingFfmpeg = false;
-      if (res.status !== 0) {
-        IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2e3)}`);
+    ]).then(
+      (res) => onMain(() => {
+        installingFfmpeg = false;
+        if (res.status !== 0) {
+          IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2e3)}`);
+          core.osd("Chromecast: could not install ffmpeg, see the plugin log");
+          return;
+        }
+        core.osd("Chromecast: ffmpeg installed");
+        sendCast();
+      })
+    ).catch(
+      (e) => onMain(() => {
+        installingFfmpeg = false;
+        IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
         core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-        return;
-      }
-      core.osd("Chromecast: ffmpeg installed");
-      sendCast();
-    }).catch((e) => {
-      installingFfmpeg = false;
-      IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
-      core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-    });
+      })
+    );
   }
   function stopCasting() {
     if (!casting) return;

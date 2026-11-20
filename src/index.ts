@@ -129,12 +129,20 @@ function sendCast() {
   global.postMessage("cast:load", lastRequest);
 }
 
+// Messages and promise callbacks can arrive on a background thread, where
+// showing a dialog crashes IINA. Timers always fire on the main thread.
+function onMain(fn: () => void) {
+  setTimeout(fn, 0);
+}
+
 // The global entry reports how the cast request went.
 global.onMessage("cast:result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
-  if (!casting) return;
-  if (!r.ok) casting = false;
-  core.osd(`Chromecast: ${r.message}`);
-  if (r.needsFfmpeg) offerFfmpegInstall();
+  onMain(() => {
+    if (!casting) return;
+    if (!r.ok) casting = false;
+    core.osd(`Chromecast: ${r.message}`);
+    if (r.needsFfmpeg) offerFfmpegInstall();
+  });
 });
 
 // ffmpeg does the conversion. If it is missing, offer to install it with
@@ -174,21 +182,25 @@ function offerFfmpegInstall() {
       "install",
       "ffmpeg",
     ])
-    .then((res) => {
-      installingFfmpeg = false;
-      if (res.status !== 0) {
-        IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2000)}`);
+    .then((res) =>
+      onMain(() => {
+        installingFfmpeg = false;
+        if (res.status !== 0) {
+          IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2000)}`);
+          core.osd("Chromecast: could not install ffmpeg, see the plugin log");
+          return;
+        }
+        core.osd("Chromecast: ffmpeg installed");
+        sendCast();
+      })
+    )
+    .catch((e) =>
+      onMain(() => {
+        installingFfmpeg = false;
+        IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
         core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-        return;
-      }
-      core.osd("Chromecast: ffmpeg installed");
-      sendCast();
-    })
-    .catch((e) => {
-      installingFfmpeg = false;
-      IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
-      core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-    });
+      })
+    );
 }
 
 function stopCasting() {
