@@ -1,6 +1,106 @@
 (() => {
+  // Info.json
+  var Info_default = {
+    name: "IINA Chromecast",
+    identifier: "com.bmak91.iina-chromecast",
+    version: "0.5.4",
+    description: "Chromecast support for IINA",
+    author: {
+      name: "Deepak Mittal",
+      email: "deepak@dpacmittal.com",
+      url: "https://dpacmittal.com"
+    },
+    entry: "dist/index.js",
+    globalEntry: "dist/global.js",
+    permissions: [
+      "show-osd",
+      "show-alert",
+      "network-request",
+      "file-system"
+    ],
+    allowedDomains: [
+      "127.0.0.1"
+    ],
+    ghRepo: "bmak91/iina-chromecast",
+    ghVersion: 17
+  };
+
+  // src/log.ts
+  var { utils, file, console: IINAConsole } = iina;
+  var LOG_DIR = "~/Library/Logs/IINA Chromecast";
+  var LOG_FILE = `${LOG_DIR}/plugin.log`;
+  var PREV_FILE = `${LOG_DIR}/plugin.prev.log`;
+  var MAX_BYTES = 1 << 20;
+  var MAX_PENDING = 500;
+  var dirRequested = false;
+  var pending = [];
+  function ensureDir() {
+    if (dirRequested) return;
+    dirRequested = true;
+    try {
+      utils.exec("/bin/mkdir", ["-p", "-m", "700", utils.resolvePath(LOG_DIR)]).catch(() => void 0);
+    } catch (e) {
+    }
+  }
+  function flush() {
+    if (pending.length === 0) return;
+    try {
+      if (!file.exists(LOG_FILE)) {
+        file.write(LOG_FILE, "");
+      }
+      const h = file.handle(LOG_FILE, "write");
+      if (!h) return;
+      h.seekToEnd();
+      const size = h.offset();
+      h.write(pending.join(""));
+      h.close();
+      pending = [];
+      if (size > MAX_BYTES) {
+        utils.exec("/bin/mv", ["-f", utils.resolvePath(LOG_FILE), utils.resolvePath(PREV_FILE)]).catch(() => void 0);
+      }
+    } catch (e) {
+      if (pending.length > MAX_PENDING) pending = pending.slice(-MAX_PENDING);
+    }
+  }
+  function text(v) {
+    if (typeof v === "string") return v;
+    if (v instanceof Error) return `${v.message}
+${v.stack || ""}`;
+    try {
+      return JSON.stringify(v);
+    } catch (e) {
+      return String(v);
+    }
+  }
+  function makeLogger(tag) {
+    ensureDir();
+    const log2 = (...args) => {
+      const msg = args.map(text).join(" ");
+      try {
+        IINAConsole.log(msg);
+      } catch (e) {
+      }
+      pending.push(`${(/* @__PURE__ */ new Date()).toISOString()} [${tag}] ${msg}
+`);
+      flush();
+    };
+    const safe2 = (what, fn) => {
+      return (...args) => {
+        try {
+          fn(...args);
+        } catch (e) {
+          log2(`ERROR in ${what}:`, e);
+        }
+      };
+    };
+    log2(`--- started, plugin ${Info_default.version} ---`);
+    setTimeout(flush, 1500);
+    return { log: log2, safe: safe2 };
+  }
+
   // src/global.ts
-  var { utils, http, global, core, console: IINAConsole } = iina;
+  var { utils: utils2, http, global } = iina;
+  var { log, safe } = makeLogger("global");
   var IDENTIFIER = "com.bmak91.iina-chromecast";
   var PLUGINS = "~/Library/Application Support/com.colliderli.iina/plugins";
   function findHelper() {
@@ -9,7 +109,7 @@
       candidates.push(`${PLUGINS}/${IDENTIFIER}${suffix}.iinaplugin/bin/casthelper`);
     }
     for (const c of candidates) {
-      if (utils.fileInPath(c)) return utils.resolvePath(c);
+      if (utils2.fileInPath(c)) return utils2.resolvePath(c);
     }
     return null;
   }
@@ -24,12 +124,12 @@
     if (m) {
       token = m[1];
       stdoutBuf = "";
-      IINAConsole.log("casthelper is up");
+      log("casthelper is up");
     }
   }
   function post(path, data) {
     if (!token) {
-      IINAConsole.log(`casthelper not ready, dropping ${path}`);
+      log(`casthelper not ready, dropping ${path}`);
       return Promise.reject({ statusCode: 0, text: "helper is not running" });
     }
     return http.post(`${CONTROL}${path}`, {
@@ -42,21 +142,23 @@
     });
   }
   function quiet(path, data) {
-    post(path, data).catch((e) => IINAConsole.log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
+    log("command", path, data || "");
+    post(path, data).catch((e) => log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
   }
   function failureMessage(e) {
     const status = e && e.statusCode;
     if (status === 424) return "ffmpeg is needed to convert this video";
     if (status === 422) return "cannot read this media";
     if (status === 0) return "helper is not running";
-    const text = e && typeof e.text === "string" ? e.text.trim() : "";
-    return text ? `failed: ${text}` : "failed";
+    const text2 = e && typeof e.text === "string" ? e.text.trim() : "";
+    return text2 ? `failed: ${text2}` : "failed";
   }
   function toPlayer(player, name, data) {
     if (!player) return;
     setTimeout(() => global.postMessage(player, name, data), 0);
   }
   function load(d, player) {
+    log("cast request from player", player, { device: d.device, path: d.path, url: d.url, start: d.start });
     const reply = (r) => toPlayer(player, "cast:result", r);
     post("/cast", d).then((res) => {
       let body = {};
@@ -69,13 +171,14 @@
       if (body.subs === "unavailable") {
         message += `, without subtitles (${body.subsNote || "not supported"})`;
       }
+      log("cast accepted:", body);
       reply({ ok: true, message });
     }).catch((e) => {
-      IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);
+      log(`casthelper /cast failed: ${JSON.stringify(e)}`);
       reply({ ok: false, message: failureMessage(e), needsFfmpeg: !!e && e.statusCode === 424 });
     });
   }
-  global.onMessage("cast:load", (d, player) => load(d, player));
+  global.onMessage("cast:load", safe("cast:load", (d, player) => load(d, player)));
   global.onMessage("cast:devices", (_d, player) => {
     if (!player) return;
     const reply = (r) => toPlayer(player, "cast:devices:list", r);
@@ -97,7 +200,7 @@
       const paused = /"paused":\s*true/.test(res && res.text || "");
       toPlayer(player, "cast:toggled", { ok: true, paused });
     }).catch((e) => {
-      IINAConsole.log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
+      log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
       toPlayer(player, "cast:toggled", { ok: false });
     });
   });
@@ -106,16 +209,16 @@
   global.onMessage("cast:seek", (d) => quiet("/seek", d));
   global.onMessage("cast:stop", () => quiet("/stop"));
   if (!bin) {
-    IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
+    log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
   } else {
-    IINAConsole.log("Starting casthelper");
-    utils.exec("/usr/bin/xattr", ["-d", "com.apple.quarantine", bin]).catch(() => void 0).then(() => startHelper(bin));
+    log("Starting casthelper");
+    utils2.exec("/usr/bin/xattr", ["-d", "com.apple.quarantine", bin]).catch(() => void 0).then(() => startHelper(bin));
   }
   function ffmpegDirs() {
-    return [utils.resolvePath("~/Downloads"), utils.resolvePath("@data/")].filter((p) => typeof p === "string" && p.startsWith("/")).join(":");
+    return [utils2.resolvePath("~/Downloads"), utils2.resolvePath("@data/")].filter((p) => typeof p === "string" && p.startsWith("/")).join(":");
   }
   function startHelper(bin2) {
-    utils.exec(
+    utils2.exec(
       bin2,
       [
         "-control",
@@ -124,16 +227,18 @@
         ":8010",
         "-ffmpeg-dirs",
         ffmpegDirs(),
-        // Kept in the plugin's own data folder, readable only by you,
-        // restarted on every launch and capped at 2 MB.
+        // Always-on log next to the plugin's own, readable only by you. The
+        // previous run is kept as helper.prev.log; each file stops at 2 MB.
         "-log",
-        utils.resolvePath("@data/casthelper.log"),
+        utils2.resolvePath(`${LOG_DIR}/helper.log`),
+        "-v",
+        "3",
         // Lets a helper started after a plugin reload replace the old one.
         "-pidfile",
-        utils.resolvePath("@data/casthelper.pid")
+        utils2.resolvePath("@data/casthelper.pid")
       ],
       void 0,
       onHelperStdout
-    ).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
+    ).then((r) => log(`casthelper exited with status ${r.status}`, (r.stderr || "").slice(-1500))).catch((e) => log(`casthelper failed to start: ${e}`));
   }
 })();

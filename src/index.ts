@@ -1,4 +1,5 @@
 import { discoverChromecasts } from "./discover";
+import { makeLogger, LOG_DIR } from "./log";
 
 const {
   utils,
@@ -6,16 +7,15 @@ const {
   mpv,
   core,
   event: IINAEvent,
-  console: IINAConsole,
   menu,
 } = iina;
 
-IINAConsole.log("Plugin is running");
+const { log, safe } = makeLogger("player");
 
 // Messages and promise callbacks can arrive on a background thread, where
 // touching the UI crashes or hangs IINA. Timers always fire on the main thread.
 const onMain = (fn: () => void) => {
-  setTimeout(fn, 0);
+  setTimeout(safe("callback", fn), 0);
 };
 
 // --- Devices and menu --------------------------------------------------------
@@ -40,14 +40,21 @@ function rebuildMenu() {
     root.addSubMenuItem(disabledItem(scanned ? "No Devices Found" : "Scanning..."));
   }
   for (const d of devices) {
-    root.addSubMenuItem(menu.item(d.name, () => castCurrent(d.address)));
+    root.addSubMenuItem(
+      menu.item(
+        d.name,
+        safe("cast menu item", () => castCurrent(d.address))
+      )
+    );
   }
   root.addSubMenuItem(menu.separator());
   root.addSubMenuItem(
-    casting ? menu.item("Stop Casting", () => stopCasting()) : disabledItem("Stop Casting")
+    casting
+      ? menu.item("Stop Casting", safe("stop menu item", () => stopCasting()))
+      : disabledItem("Stop Casting")
   );
 
-  root.addSubMenuItem(menu.item("Show Helper Log", () => utils.open("@data/casthelper.log")));
+  root.addSubMenuItem(menu.item("Show Logs", () => utils.open(utils.resolvePath(LOG_DIR))));
 
   menu.removeAllItems();
   menu.addItem(root);
@@ -61,9 +68,11 @@ function disabledItem(title: string) {
 }
 
 function setDevices(list: Device[]) {
+  const before = JSON.stringify(devices);
   devices = list
     .filter((d) => d && typeof d.name === "string" && typeof d.address === "string")
     .sort((a, b) => a.name.localeCompare(b.name) || a.address.localeCompare(b.address));
+  if (JSON.stringify(devices) !== before || !scanned) log("devices:", devices);
   scanned = true;
   rebuildMenu();
 }
@@ -76,6 +85,7 @@ global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[]; castin
   onMain(() => {
     // The session ended on the device (stopped with the TV remote, TV off...).
     if (r.ok && r.casting === false && casting && castConfirmed) {
+      log("the helper reports the session has ended");
       endCasting();
       core.osd("Chromecast: casting ended");
     }
@@ -122,6 +132,7 @@ function slowScan() {
 }
 
 IINAEvent.on("iina.window-loaded", () => {
+  log("window loaded");
   rebuildMenu();
   refreshDevices();
   // The helper may still be starting; ask again shortly, then keep polling.
@@ -250,11 +261,11 @@ function castCurrent(device: string | null) {
     return;
   }
   if (!source) {
-    IINAConsole.log(`Cannot cast this source: ${JSON.stringify(url)}`);
+    log(`Cannot cast this source: ${JSON.stringify(url)}`);
     core.osd(url ? "Chromecast: this source cannot be cast" : "Chromecast: no file is open");
     return;
   }
-  IINAConsole.log("Casting current media to ", device);
+  log("cast requested:", { device, source, title: core.status.title });
   lastRequest = {
     device,
     ...source,
@@ -264,6 +275,7 @@ function castCurrent(device: string | null) {
   };
   const sub = selectedSubtitle();
   if (sub) lastRequest.sub = sub;
+  log("cast request:", lastRequest);
   sendCast();
 }
 
@@ -279,6 +291,7 @@ function sendCast() {
 // The global entry reports how the cast request went.
 global.onMessage("cast:result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
   onMain(() => {
+    log("cast result:", r);
     if (!casting) return;
     if (r.ok) castConfirmed = true;
     else endCasting();
@@ -305,19 +318,27 @@ function offerFfmpegInstall() {
 
 function stopCasting() {
   if (!casting) return;
+  log("stop casting");
   endCasting();
   global.postMessage("cast:stop", {});
   core.osd("Chromecast: stopped");
 }
 
 // Don't leave the file being served once the window that cast it is gone.
-IINAEvent.on("iina.window-will-close", stopCasting);
+IINAEvent.on(
+  "iina.window-will-close",
+  safe("window close", () => {
+    log("window closing");
+    stopCasting();
+  })
+);
 
 // Pressing play/pause in IINA toggles playback on the device. The local player
 // is put straight back to paused, so nothing plays on the Mac.
 IINAEvent.on("mpv.pause.changed", () => {
   if (!casting) return;
   if (mpv.getFlag("pause")) return; // our own pause, nothing to do
+  log("play/pause pressed: toggling the device");
   core.pause();
   // The helper knows the device's real state (it may have been paused with
   // the TV remote), so it decides which way to toggle and reports back.
@@ -331,7 +352,12 @@ global.onMessage("cast:toggled", (r: { ok: boolean; paused?: boolean }) => {
   });
 });
 
-IINAEvent.on("mpv.seek", () => {
-  if (!casting) return;
-  global.postMessage("cast:seek", { time: mpv.getNumber("time-pos") });
-});
+IINAEvent.on(
+  "mpv.seek",
+  safe("seek", () => {
+    if (!casting) return;
+    const time = mpv.getNumber("time-pos");
+    log("seek to", time);
+    global.postMessage("cast:seek", { time });
+  })
+);

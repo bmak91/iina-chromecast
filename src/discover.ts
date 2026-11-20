@@ -4,7 +4,15 @@
 //
 // Requires the "file-system" permission in Info.json (needed for utils.exec).
 
-const { utils, console } = iina;
+import { makeLogger } from "./log";
+
+const { utils } = iina;
+const console = { log: (...a: any[]) => makeLoggerOnce()(...a) };
+let cached: ((...a: any[]) => void) | null = null;
+function makeLoggerOnce() {
+  if (!cached) cached = makeLogger("scan").log;
+  return cached;
+}
 
 // Decoded capability bits from the `ca` TXT field. Only the low I/O bits are
 // reliably documented across firmware; `raw` preserves the full value.

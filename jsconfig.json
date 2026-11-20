@@ -1,11 +1,19 @@
 {
   "compilerOptions": {
     "target": "ES2019",
-    "lib": ["ES2019"],
+    "lib": [
+      "ES2019"
+    ],
     "moduleResolution": "node",
     "noEmit": true,
     "skipLibCheck": true,
-    "types": []
+    "types": [],
+    "resolveJsonModule": true,
+    "esModuleInterop": true
   },
-  "files": ["node_modules/iina-plugin-definition/iina/index.d.ts", "src/index.ts", "src/global.ts"]
+  "files": [
+    "node_modules/iina-plugin-definition/iina/index.d.ts",
+    "src/index.ts",
+    "src/global.ts"
+  ]
 }

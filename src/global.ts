@@ -1,4 +1,7 @@
-const { utils, http, global, core, console: IINAConsole } = iina;
+import { makeLogger, LOG_DIR } from "./log";
+
+const { utils, http, global } = iina;
+const { log, safe } = makeLogger("global");
 
 // The helper ships inside the plugin (bin/casthelper, built from go-casthelper/
 // by build-helper.sh). Nothing is downloaded at runtime. A copy you built
@@ -35,13 +38,13 @@ function onHelperStdout(out: string) {
   if (m) {
     token = m[1];
     stdoutBuf = "";
-    IINAConsole.log("casthelper is up");
+    log("casthelper is up");
   }
 }
 
 function post(path: string, data?: Record<string, any>) {
   if (!token) {
-    IINAConsole.log(`casthelper not ready, dropping ${path}`);
+    log(`casthelper not ready, dropping ${path}`);
     return Promise.reject({ statusCode: 0, text: "helper is not running" });
   }
   return http.post(`${CONTROL}${path}`, {
@@ -55,7 +58,8 @@ function post(path: string, data?: Record<string, any>) {
 }
 
 function quiet(path: string, data?: Record<string, any>) {
-  post(path, data).catch((e) => IINAConsole.log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
+  log("command", path, data || "");
+  post(path, data).catch((e) => log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
 }
 
 function failureMessage(e: any): string {
@@ -78,6 +82,7 @@ function toPlayer(player: string | undefined, name: string, data: Record<string,
 // Results go back to the player window that asked. (A null target would only
 // reach players created by the plugin, not the user's windows.)
 function load(d: Record<string, any>, player?: string) {
+  log("cast request from player", player, { device: d.device, path: d.path, url: d.url, start: d.start });
   const reply = (r: Record<string, any>) => toPlayer(player, "cast:result", r);
   post("/cast", d)
     .then((res) => {
@@ -90,16 +95,17 @@ function load(d: Record<string, any>, player?: string) {
       if (body.subs === "unavailable") {
         message += `, without subtitles (${body.subsNote || "not supported"})`;
       }
+      log("cast accepted:", body);
       reply({ ok: true, message });
     })
     .catch((e) => {
-      IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);
+      log(`casthelper /cast failed: ${JSON.stringify(e)}`);
       reply({ ok: false, message: failureMessage(e), needsFfmpeg: !!e && e.statusCode === 424 });
     });
 }
 
 // messages arrive from each player's main entry
-global.onMessage("cast:load", (d, player) => load(d, player));
+global.onMessage("cast:load", safe("cast:load", (d: any, player?: string) => load(d, player)));
 global.onMessage("cast:devices", (_d, player) => {
   if (!player) return;
   const reply = (r: Record<string, any>) => toPlayer(player, "cast:devices:list", r);
@@ -126,7 +132,7 @@ global.onMessage("cast:toggle", (_d, player) => {
       toPlayer(player, "cast:toggled", { ok: true, paused });
     })
     .catch((e) => {
-      IINAConsole.log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
+      log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
       toPlayer(player, "cast:toggled", { ok: false });
     });
 });
@@ -136,9 +142,9 @@ global.onMessage("cast:seek", (d) => quiet("/seek", d));
 global.onMessage("cast:stop", () => quiet("/stop"));
 
 if (!bin) {
-  IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
+  log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
 } else {
-  IINAConsole.log("Starting casthelper");
+  log("Starting casthelper");
   // macOS tags files IINA downloads as quarantined, and Gatekeeper then refuses
   // to run the helper because it is not notarized by Apple. Clear that tag on
   // our own helper (and nothing else) before starting it.
@@ -164,15 +170,16 @@ function startHelper(bin: string) {
         "-control", "127.0.0.1:9092",
         "-media", ":8010",
         "-ffmpeg-dirs", ffmpegDirs(),
-        // Kept in the plugin's own data folder, readable only by you,
-        // restarted on every launch and capped at 2 MB.
-        "-log", utils.resolvePath("@data/casthelper.log"),
+        // Always-on log next to the plugin's own, readable only by you. The
+        // previous run is kept as helper.prev.log; each file stops at 2 MB.
+        "-log", utils.resolvePath(`${LOG_DIR}/helper.log`),
+        "-v", "3",
         // Lets a helper started after a plugin reload replace the old one.
         "-pidfile", utils.resolvePath("@data/casthelper.pid"),
       ],
       undefined,
       onHelperStdout
     )
-    .then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`))
-    .catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
+    .then((r) => log(`casthelper exited with status ${r.status}`, (r.stderr || "").slice(-1500)))
+    .catch((e) => log(`casthelper failed to start: ${e}`));
 }

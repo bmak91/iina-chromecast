@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 )
@@ -40,12 +41,14 @@ func setupLogging(path string, level int) {
 
 	w := io.Writer(os.Stderr)
 	if path != "" {
+		// The log is always on. Keep the previous run next to it and stop
+		// each file at 2 MB, so it never grows without bound.
+		_ = os.MkdirAll(filepath.Dir(path), 0o700)
+		_ = os.Rename(path, strings.TrimSuffix(path, filepath.Ext(path))+".prev"+filepath.Ext(path))
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			logger.Printf("[ERROR] cannot open log file %s: %v (stderr only)", path, err)
 		} else {
-			// Start fresh on every launch and stop at 2 MB, so the file
-			// never grows without bound.
 			w = io.MultiWriter(os.Stderr, &cappedWriter{w: f, left: 2 << 20})
 		}
 	}

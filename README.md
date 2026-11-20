@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: 71133f78f0463abce0a03b12d3978f1c295bef1aa0ccaab79c71a5d338cc4bb5
+# expected: 9e31ce0037f091cba7e0c84d96ca31eb1c55554c0021351e8645720af3b74fa1
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -98,8 +98,7 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
 | The plugin downloaded an unsigned `casthelper` binary from the upstream repo's *latest* release and ran it at every IINA launch. | Nothing is downloaded at runtime. The helper ships in the repo and its build is reproducible from the source. |
 | – | ffmpeg is started with an argument array (no shell) and a protocol whitelist: a network stream cannot make it open local files, and a local file cannot make it reach the network. |
 | `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `show-alert`, `network-request`, `file-system`. |
-| A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | The log lives in the plugin's data folder, readable only by you (`0600`), is restarted on every launch and capped at 2 MB. *Show Helper Log* in the menu opens it. |
-| Device replies on the LAN were only read through `dns-sd`. | The helper parses mDNS replies itself: bounds-checked, fuzzed, and it ignores devices that claim a non-private address. |
+| A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | Logs are always on, in `~/Library/Logs/IINA Chromecast/` (`plugin.log` and `helper.log`, plus the previous run). The helper's files are created `0600` in a `0700` folder and every file is capped. *Show Logs* in the menu opens the folder. |
 | No way to stop casting from IINA. | *Stop Casting* menu item. Casting also stops when the window closes. |
 
 ## Known limits
