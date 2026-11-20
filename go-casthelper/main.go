@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -16,7 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,8 +37,11 @@ import (
 //     under an unguessable per-session path, and only answers the device's IP.
 type app struct {
 	mu          sync.Mutex
-	file        string       // resolved absolute path of the file being served
+	src         source       // what is being served: a local file or a stream URL
+	plan        *plan        // how it is converted; nil = served untouched
+	title       string       // shown on the device
 	contentType string       // content type advertised to the device in LOAD
+	mediaURL    string       // URL handed to the device for this session
 	mediaToken  string       // random path component for the current session
 	deviceIP    netip.Addr   // the only address allowed to fetch the media
 	cast        *castConn    // active connection, or nil
@@ -48,6 +52,10 @@ type app struct {
 	mediaPort   string // port the media server binds to
 	mediaBindIP string // optional override for the media bind/advertise address
 
+	tools      *tools             // ffmpeg/ffprobe, nil if not installed
+	convCancel context.CancelFunc // stops the running conversion, if any
+	convSeq    uint64
+
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
 }
@@ -55,15 +63,16 @@ type app struct {
 // allowLoopbackDevice lets tests cast to a fake device on 127.0.0.1.
 var allowLoopbackDevice = false
 
-// Containers the Default Media Receiver can plausibly play. Anything else is
-// refused, so the helper can never be talked into serving arbitrary files.
+// Media file types. Anything else is refused, so the helper can never be
+// talked into serving arbitrary files.
 var mediaExtensions = map[string]bool{
 	".mp4": true, ".m4v": true, ".mov": true, ".webm": true, ".mkv": true,
+	".avi": true, ".ts": true, ".m2ts": true, ".mts": true, ".mpg": true,
+	".mpeg": true, ".wmv": true, ".flv": true, ".3gp": true, ".ogv": true,
 	".mp3": true, ".m4a": true, ".aac": true, ".ogg": true, ".oga": true,
-	".opus": true, ".flac": true, ".wav": true,
+	".opus": true, ".flac": true, ".wav": true, ".mka": true, ".ac3": true,
+	".wma": true, ".m4b": true,
 }
-
-var contentTypeRE = regexp.MustCompile(`^(video|audio)/[A-Za-z0-9.+-]{1,64}$`)
 
 func main() {
 	controlAddr := flag.String("control", "127.0.0.1:9092", "loopback control API address (for the IINA plugin)")
@@ -71,6 +80,7 @@ func main() {
 	advertiseIP := flag.String("ip", "", "LAN IP to bind and advertise to the device (default: the address that reaches the device)")
 	verbosity := flag.Int("v", lvlInfo, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
 	logPath := flag.String("log", "", "also append logs to this file (created 0600; default: stderr only)")
+	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: look in the usual install locations)")
 	flag.Parse()
 
 	setupLogging(*logPath, *verbosity)
@@ -113,6 +123,12 @@ func main() {
 		controlAddr: *controlAddr,
 		mediaPort:   mediaPort,
 		mediaBindIP: bindIP,
+		tools:       findTools(*ffmpegPath),
+	}
+	if a.tools == nil {
+		logWarn("ffmpeg not found: files the device cannot play directly, and network streams, cannot be cast")
+	} else {
+		logInfo("using %s for conversion", a.tools.ffmpeg)
 	}
 
 	ctrlLn, err := net.Listen("tcp", *controlAddr)
@@ -269,8 +285,9 @@ func (a *app) logged(kind string, h http.HandlerFunc) http.HandlerFunc {
 
 func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
-	path, ct, token, device := a.file, a.contentType, a.mediaToken, a.deviceIP
+	src, pl, ct, token, device := a.src, a.plan, a.contentType, a.mediaToken, a.deviceIP
 	a.mu.Unlock()
+	path := src.location
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -288,6 +305,14 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hits := a.mediaHits.Add(1)
+	logDebug("media: request #%d from %s (Range %q)", hits, r.RemoteAddr, r.Header.Get("Range"))
+
+	if pl != nil {
+		a.serveConverted(w, r, src, pl)
+		return
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		logError("media: cannot open %q: %v", path, err)
@@ -302,9 +327,6 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hits := a.mediaHits.Add(1)
-	logDebug("media: request #%d from %s (Range %q)", hits, r.RemoteAddr, r.Header.Get("Range"))
-
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// ServeContent honors Range requests, which is what lets the device seek.
@@ -312,10 +334,12 @@ func (a *app) handleMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 type castRequest struct {
-	Device      string `json:"device"`      // "192.168.1.50" or "192.168.1.50:8009"
-	Path        string `json:"path"`        // absolute path of the local file
-	ContentType string `json:"contentType"` // e.g. "video/mp4"
-	Title       string `json:"title"`
+	Device string  `json:"device"` // "192.168.1.50" or "192.168.1.50:8009"
+	Path   string  `json:"path"`   // absolute path of a local file, or
+	URL    string  `json:"url"`    // http(s) URL of a network stream
+	Title  string  `json:"title"`  // shown on the device
+	Start  float64 `json:"start"`  // position to start at, in seconds
+	Aid    int     `json:"aid"`    // mpv's 1-based audio track id, 0 = default
 }
 
 // parseDevice accepts only a literal private/link-local IP (optionally with a
@@ -381,24 +405,51 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	path, err := resolveMediaPath(req.Path)
-	if err != nil {
-		logError("cast: rejected path: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.ContentType == "" {
-		req.ContentType = "video/mp4"
-	}
-	if !contentTypeRE.MatchString(req.ContentType) {
-		http.Error(w, "contentType must be video/* or audio/*", http.StatusBadRequest)
-		return
+	var src source
+	if req.URL != "" {
+		u, err := parseStreamURL(req.URL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		src = source{location: u, isURL: true}
+	} else {
+		path, err := resolveMediaPath(req.Path)
+		if err != nil {
+			logError("cast: rejected path: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		src = source{location: path}
 	}
 	if len(req.Title) > 512 {
 		req.Title = req.Title[:512]
 	}
-	logMediaTypeHint(path, req.ContentType)
+	if req.Start < 0 {
+		req.Start = 0
+	}
 
+	// Decide whether the device can play the source as it is.
+	var pl *plan
+	contentType := "video/mp4"
+	switch {
+	case a.tools != nil:
+		probed, err := a.tools.probe(src)
+		if err != nil {
+			logError("cast: cannot read the media: %v", err)
+			http.Error(w, "cannot read the media", http.StatusUnprocessableEntity)
+			return
+		}
+		pl = decide(src, probed, req.Aid)
+	case src.isURL:
+		http.Error(w, "ffmpeg is required to cast network streams", http.StatusFailedDependency)
+		return
+	default:
+		logWarn("cast: ffmpeg not found, sending the file as it is")
+	}
+	if pl == nil {
+		contentType = directContentType(src.location)
+	}
 	// One session at a time: drop whatever was being served before.
 	a.stopSession(false)
 
@@ -438,14 +489,14 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 	logInfo("media server listening on %s for device %s only", ln.Addr(), device.Addr())
 
 	a.mu.Lock()
-	a.file, a.contentType = path, req.ContentType
-	a.mediaToken, a.deviceIP = mediaToken, device.Addr()
+	mediaURL := fmt.Sprintf("http://%s/media/%s", net.JoinHostPort(bindIP, a.mediaPort), mediaToken)
+	a.src, a.plan, a.title, a.contentType = src, pl, req.Title, contentType
+	a.mediaURL, a.mediaToken, a.deviceIP = mediaURL, mediaToken, device.Addr()
 	a.cast, a.mediaSrv = conn, srv
 	a.mu.Unlock()
 	conn.setOnClose(func() { a.endSession(conn) })
 
-	mediaURL := fmt.Sprintf("http://%s/media/%s", net.JoinHostPort(bindIP, a.mediaPort), mediaToken)
-	if err := conn.launchAndLoad(mediaURL, req.ContentType, req.Title); err != nil {
+	if err := conn.launchAndLoad(a.mediaInfoAt(req.Start)); err != nil {
 		logError("cast: launchAndLoad failed: %v", err)
 		a.endSession(conn)
 		conn.Close()
@@ -455,7 +506,30 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 	logInfo("cast: LOAD accepted")
 	a.watchForMediaFetch()
 
-	writeJSON(w, map[string]any{"ok": true})
+	mode := "direct"
+	if pl != nil {
+		mode = "convert"
+	}
+	writeJSON(w, map[string]any{"ok": true, "mode": mode})
+}
+
+// mediaInfoAt describes the current session's media starting at the given
+// position. A converted stream cannot be seeked by the device, so the position
+// is baked into the URL and ffmpeg starts there.
+func (a *app) mediaInfoAt(start float64) mediaInfo {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	m := mediaInfo{url: a.mediaURL, contentType: a.contentType, title: a.title, startTime: start}
+	if a.plan != nil {
+		m.startTime = 0
+		if start > 0 {
+			m.url += "?start=" + strconv.FormatFloat(start, 'f', 3, 64)
+		}
+		if a.plan.duration > start {
+			m.duration = a.plan.duration - start
+		}
+	}
+	return m
 }
 
 // endSession stops serving media if conn is still the active session.
@@ -467,8 +541,13 @@ func (a *app) endSession(conn *castConn) {
 	}
 	srv := a.mediaSrv
 	a.cast, a.mediaSrv = nil, nil
-	a.file, a.contentType, a.mediaToken = "", "", ""
+	a.src, a.plan = source{}, nil
+	a.title, a.contentType, a.mediaURL, a.mediaToken = "", "", "", ""
 	a.deviceIP = netip.Addr{}
+	if a.convCancel != nil {
+		a.convCancel()
+		a.convCancel = nil
+	}
 	a.mu.Unlock()
 	if srv != nil {
 		srv.Close()
@@ -541,6 +620,14 @@ func (a *app) handleSeek(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid seek body", http.StatusBadRequest)
 		return
 	}
+	a.mu.Lock()
+	converting := a.plan != nil
+	a.mu.Unlock()
+	if converting {
+		// Restart the conversion at the new position.
+		a.simpleCmd("SEEK", func(c *castConn) error { return c.load(a.mediaInfoAt(body.Time)) })(w, r)
+		return
+	}
 	a.simpleCmd("SEEK", func(c *castConn) error { return c.seek(body.Time) })(w, r)
 }
 
@@ -576,18 +663,5 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		logError("cannot write JSON response: %v", err)
-	}
-}
-
-// logMediaTypeHint warns about combinations the Default Media Receiver is known
-// to reject outright, which looks like "casting silently does nothing".
-func logMediaTypeHint(path, contentType string) {
-	ext := strings.ToLower(filepath.Ext(path))
-	if ext == ".mkv" {
-		logWarn("media type: %s often fails on the Default Media Receiver; "+
-			"MP4/WebM with H.264/VP8 video and AAC/Vorbis audio play reliably.", ext)
-	}
-	if ext == ".mp4" && contentType != "video/mp4" {
-		logWarn("media type: %s is advertised as %q; a mismatched content type makes the receiver refuse the stream", ext, contentType)
 	}
 }

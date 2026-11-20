@@ -77,38 +77,58 @@ async function dynamicMenu() {
 
 let casting = false;
 
-// Only local files can be cast: the helper serves the file itself.
-// core.status.url is already percent-decoded by IINA, so it must not be decoded
-// again (a "%" in the file name would break).
-function localPath(url: string | undefined | null): string | null {
+// What is playing: a local file (served by the helper) or a network stream
+// (fetched and converted by the helper). core.status.url is already
+// percent-decoded by IINA, so file URLs must not be decoded again.
+function currentSource(url: string | undefined | null): { path?: string; url?: string } | null {
   if (typeof url !== "string" || url === "") return null;
-  if (url.startsWith("file://localhost/")) return url.slice("file://localhost".length);
-  if (url.startsWith("file:///")) return url.slice("file://".length);
-  return url.startsWith("/") ? url : null;
+  if (url.startsWith("file://localhost/")) return { path: url.slice("file://localhost".length) };
+  if (url.startsWith("file:///")) return { path: url.slice("file://".length) };
+  if (url.startsWith("/")) return { path: url };
+  if (/^https?:\/\//i.test(url)) return { url };
+  return null;
+}
+
+function numberOrZero(get: () => number): number {
+  try {
+    const n = get();
+    return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
+  } catch (e) {
+    return 0;
+  }
 }
 
 function castCurrent(device: string | null) {
   const url = core.status.url;
-  const path = localPath(url);
+  const source = currentSource(url);
   if (!device) {
     core.osd("Chromecast: device address not found");
     return;
   }
-  if (!path) {
-    IINAConsole.log(`Cannot cast, not a local file: ${JSON.stringify(url)}`);
-    core.osd(url ? "Chromecast: only local files can be cast" : "Chromecast: no file is open");
+  if (!source) {
+    IINAConsole.log(`Cannot cast this source: ${JSON.stringify(url)}`);
+    core.osd(url ? "Chromecast: this source cannot be cast" : "Chromecast: no file is open");
     return;
   }
   IINAConsole.log("Casting current media to ", device);
+  core.osd("Chromecast: connecting…");
   global.postMessage("cast:load", {
     device,
-    path,
-    contentType: "video/mp4",
+    ...source,
     title: core.status.title || "IINA",
+    start: numberOrZero(() => mpv.getNumber("time-pos")),
+    aid: numberOrZero(() => mpv.getNumber("aid")),
   });
   casting = true;
   core.pause(); // stop decoding locally; IINA is now the remote
 }
+
+// The global entry reports how the cast request went.
+global.onMessage("cast:result", (r: { ok: boolean; message: string }) => {
+  if (!casting) return;
+  if (!r.ok) casting = false;
+  core.osd(`Chromecast: ${r.message}`);
+});
 
 function stopCasting() {
   if (!casting) return;

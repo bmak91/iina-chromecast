@@ -30,22 +30,45 @@
   function post(path, data) {
     if (!token) {
       IINAConsole.log(`casthelper not ready, dropping ${path}`);
-      return;
+      return Promise.reject({ statusCode: 0, text: "helper is not running" });
     }
-    http.post(`${CONTROL}${path}`, {
+    return http.post(`${CONTROL}${path}`, {
       params: {},
       data: data || {},
       headers: {
         "Content-Type": "application/json",
         "X-Cast-Token": token
       }
-    }).catch((e) => IINAConsole.log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
+    });
   }
-  global.onMessage("cast:load", (d) => post("/cast", d));
-  global.onMessage("cast:pause", () => post("/pause"));
-  global.onMessage("cast:play", () => post("/play"));
-  global.onMessage("cast:seek", (d) => post("/seek", d));
-  global.onMessage("cast:stop", () => post("/stop"));
+  function quiet(path, data) {
+    post(path, data).catch((e) => IINAConsole.log(`casthelper ${path} failed: ${JSON.stringify(e)}`));
+  }
+  function failureMessage(e) {
+    const status = e && e.statusCode;
+    if (status === 424) return "install ffmpeg to cast this (brew install ffmpeg)";
+    if (status === 422) return "cannot read this media";
+    if (status === 0) return "helper is not running";
+    const text = e && typeof e.text === "string" ? e.text.trim() : "";
+    return text ? `failed: ${text}` : "failed";
+  }
+  function load(d) {
+    post("/cast", d).then((res) => {
+      const converting = /"mode":\s*"convert"/.test(res && res.text || "");
+      global.postMessage(null, "cast:result", {
+        ok: true,
+        message: converting ? "casting (converting on the fly)" : "casting"
+      });
+    }).catch((e) => {
+      IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);
+      global.postMessage(null, "cast:result", { ok: false, message: failureMessage(e) });
+    });
+  }
+  global.onMessage("cast:load", (d) => load(d));
+  global.onMessage("cast:pause", () => quiet("/pause"));
+  global.onMessage("cast:play", () => quiet("/play"));
+  global.onMessage("cast:seek", (d) => quiet("/seek", d));
+  global.onMessage("cast:stop", () => quiet("/stop"));
   if (!bin) {
     IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
   } else {

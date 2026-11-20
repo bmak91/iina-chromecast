@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -100,7 +102,8 @@ func TestCastRejectsBadInput(t *testing.T) {
 		"public device ip":     `{"device":"8.8.8.8","path":"` + movie + `"}`,
 		"hostname device":      `{"device":"evil.example:443","path":"` + movie + `"}`,
 		"loopback device":      `{"device":"127.0.0.1:22","path":"` + movie + `"}`,
-		"bad content type":     `{"device":"192.168.1.2","path":"` + movie + `","contentType":"text/html"}`,
+		"non-http stream url":  `{"device":"192.168.1.2","url":"file:///etc/passwd"}`,
+		"ftp stream url":       `{"device":"192.168.1.2","url":"ftp://example.com/a.mkv"}`,
 		"not json":             `device=1`,
 	}
 	for name, body := range bodies {
@@ -126,7 +129,7 @@ func fakeDevice(t *testing.T) (addr string, loaded chan string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	loaded = make(chan string, 1)
+	loaded = make(chan string, 8)
 
 	go func() {
 		for {
@@ -230,7 +233,189 @@ func TestCastSessionServesOnlyTheDeviceAndStopsAfterwards(t *testing.T) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.file != "" || a.mediaToken != "" || a.cast != nil {
+	if a.src.location != "" || a.mediaToken != "" || a.cast != nil {
 		t.Errorf("session state not cleared after stop")
+	}
+}
+
+func testTools(t *testing.T) *tools {
+	t.Helper()
+	tl := findTools("")
+	if tl == nil {
+		t.Skip("ffmpeg/ffprobe not installed")
+	}
+	return tl
+}
+
+// makeSample writes a short clip with the given codecs using ffmpeg.
+func makeSample(t *testing.T, tl *tools, name string, codecArgs ...string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), name)
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=25",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=4"}
+	args = append(args, codecArgs...)
+	args = append(args, out)
+	if b, err := exec.Command(tl.ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Skipf("cannot create sample %s: %v: %s", name, err, b)
+	}
+	return out
+}
+
+// codecsOf fetches a media URL the way the device would and reports what it got.
+func codecsOf(t *testing.T, tl *tools, mediaURL string) (format, video, audio string, duration float64) {
+	t.Helper()
+	resp, err := http.Get(mediaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET media: status %d", resp.StatusCode)
+	}
+	f := filepath.Join(t.TempDir(), "out.mp4")
+	data, _ := io.ReadAll(resp.Body)
+	os.WriteFile(f, data, 0o600)
+	r, err := tl.probe(source{location: f})
+	if err != nil {
+		t.Fatalf("converted output is not valid media: %v", err)
+	}
+	for _, s := range r.Streams {
+		if s.CodecType == "video" {
+			video = s.CodecName
+		}
+		if s.CodecType == "audio" {
+			audio = s.CodecName
+		}
+	}
+	// Fragmented MP4 has no global duration; measure it from the packets.
+	out, _ := exec.Command(tl.ffprobe, "-v", "error", "-show_entries", "packet=pts_time", "-select_streams", "a:0", "-of", "csv=p=0", f).Output()
+	lines := strings.Fields(strings.TrimSpace(string(out)))
+	if len(lines) > 0 {
+		duration, _ = strconv.ParseFloat(strings.Trim(lines[len(lines)-1], ","), 64)
+	}
+	return r.Format.FormatName, video, audio, duration
+}
+
+func castForTest(t *testing.T, a *app, srv *httptest.Server, body string) (mode string) {
+	t.Helper()
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	_, a.mediaPort, _ = net.SplitHostPort(l.Addr().String())
+	l.Close()
+	resp := do(t, "POST", srv.URL+"/cast", body, map[string]string{"X-Cast-Token": "secret-token"})
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cast: got %d: %s", resp.StatusCode, b)
+	}
+	var out struct{ Mode string }
+	json.Unmarshal(b, &out)
+	return out.Mode
+}
+
+func TestUnsupportedFileIsConvertedOnTheFly(t *testing.T) {
+	tl := testTools(t)
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+	a, srv := newTestApp(t)
+	a.tools = tl
+	tok := map[string]string{"X-Cast-Token": "secret-token"}
+
+	// HEVC video + AC-3 audio in MKV: nothing the default receiver plays.
+	movie := makeSample(t, tl, "movie.mkv", "-c:v", "libx265", "-preset", "ultrafast", "-c:a", "ac3")
+	device, loaded := fakeDevice(t)
+	if mode := castForTest(t, a, srv, `{"device":"`+device+`","path":"`+movie+`"}`); mode != "convert" {
+		t.Fatalf("mode = %q, want convert", mode)
+	}
+	format, video, audio, dur := codecsOf(t, tl, <-loaded)
+	if !strings.Contains(format, "mp4") || video != "h264" || audio != "aac" {
+		t.Errorf("device received %s / %s / %s, want mp4 / h264 / aac", format, video, audio)
+	}
+	if dur < 3 {
+		t.Errorf("converted stream is %.1fs long, want about 4s", dur)
+	}
+
+	// Seeking restarts the conversion at the new position.
+	if r := do(t, "POST", srv.URL+"/seek", `{"time":2.5}`, tok); r.StatusCode != http.StatusOK {
+		t.Fatalf("seek: got %d", r.StatusCode)
+	}
+	seekURL := <-loaded
+	if !strings.Contains(seekURL, "?start=2.500") {
+		t.Fatalf("seek did not reload at the new position: %q", seekURL)
+	}
+	if _, _, _, dur := codecsOf(t, tl, seekURL); dur > 2.5 || dur < 0.5 {
+		t.Errorf("stream after seeking to 2.5s is %.1fs long, want about 1.5s", dur)
+	}
+	do(t, "POST", srv.URL+"/stop", "", tok)
+}
+
+func TestH264InMKVIsRepackagedWithoutReencoding(t *testing.T) {
+	tl := testTools(t)
+	movie := makeSample(t, tl, "movie.mkv", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "ac3")
+	src := source{location: movie}
+	r, err := tl.probe(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := decide(src, r, 0)
+	if p == nil || !p.copyVideo {
+		t.Fatalf("plan = %+v, want conversion with video copy", p)
+	}
+	if args := strings.Join(tl.ffmpegArgs(src, p, 0), " "); !strings.Contains(args, "-c:v copy") {
+		t.Errorf("ffmpeg args do not copy the video: %s", args)
+	}
+}
+
+func TestPlainMP4IsServedDirectly(t *testing.T) {
+	tl := testTools(t)
+	movie := makeSample(t, tl, "movie.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac")
+	src := source{location: movie}
+	r, err := tl.probe(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decide(src, r, 0); p != nil {
+		t.Errorf("plan = %+v, want direct play", p)
+	}
+}
+
+func TestNetworkStreamIsConverted(t *testing.T) {
+	tl := testTools(t)
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+	a, srv := newTestApp(t)
+	a.tools = tl
+
+	movie := makeSample(t, tl, "movie.mkv", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "ac3")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, movie)
+	}))
+	t.Cleanup(origin.Close)
+
+	device, loaded := fakeDevice(t)
+	if mode := castForTest(t, a, srv, `{"device":"`+device+`","url":"`+origin.URL+`/stream"}`); mode != "convert" {
+		t.Fatalf("mode = %q, want convert", mode)
+	}
+	format, video, audio, _ := codecsOf(t, tl, <-loaded)
+	if !strings.Contains(format, "mp4") || video != "h264" || audio != "aac" {
+		t.Errorf("device received %s / %s / %s, want mp4 / h264 / aac", format, video, audio)
+	}
+}
+
+func TestNetworkStreamCannotMakeFFmpegReadLocalFiles(t *testing.T) {
+	tl := testTools(t)
+	a, srv := newTestApp(t)
+	a.tools = tl
+
+	local := makeSample(t, tl, "private.mkv", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac")
+	// A hostile playlist that points back at a file on this machine.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:4,\nfile://"+local+"\n#EXT-X-ENDLIST\n")
+	}))
+	t.Cleanup(origin.Close)
+
+	resp := do(t, "POST", srv.URL+"/cast", `{"device":"192.168.1.2","url":"`+origin.URL+`/x.m3u8"}`, map[string]string{"X-Cast-Token": "secret-token"})
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("playlist pointing at a local file: got %d, want 422", resp.StatusCode)
 	}
 }

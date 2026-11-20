@@ -384,8 +384,8 @@ func (c *castConn) Close() {
 
 // launchAndLoad launches the Default Media Receiver, opens a connection to the
 // resulting session, and issues LOAD for the given media URL.
-func (c *castConn) launchAndLoad(mediaURL, contentType, title string) error {
-	logInfo("launchAndLoad: contentType=%s title=%q", contentType, title)
+func (c *castConn) launchAndLoad(m mediaInfo) error {
+	logInfo("launchAndLoad: contentType=%s title=%q", m.contentType, m.title)
 
 	transportID, err := c.launchReceiver()
 	if err != nil {
@@ -404,19 +404,45 @@ func (c *castConn) launchAndLoad(mediaURL, contentType, title string) error {
 		return err
 	}
 
+	return c.load(m)
+}
+
+// mediaInfo describes what the device is asked to play.
+type mediaInfo struct {
+	url         string
+	contentType string
+	title       string
+	startTime   float64 // position to start at, in seconds
+	duration    float64 // total length in seconds, 0 if unknown
+}
+
+// load issues LOAD on the already launched receiver. It can be called again
+// on the same session to replace what is playing.
+func (c *castConn) load(m mediaInfo) error {
+	c.sessMu.Lock()
+	transportID := c.transportID
+	c.sessMu.Unlock()
+	if transportID == "" {
+		return errors.New("receiver is not launched")
+	}
+
+	media := map[string]any{
+		"contentId":   m.url,
+		"streamType":  "BUFFERED",
+		"contentType": m.contentType,
+		"metadata": map[string]any{
+			"type":  0, // GENERIC
+			"title": m.title,
+		},
+	}
+	if m.duration > 0 {
+		media["duration"] = m.duration
+	}
 	load := map[string]any{
 		"type":        "LOAD",
 		"autoplay":    true,
-		"currentTime": 0,
-		"media": map[string]any{
-			"contentId":   mediaURL,
-			"streamType":  "BUFFERED",
-			"contentType": contentType,
-			"metadata": map[string]any{
-				"type":  0, // GENERIC
-				"title": title,
-			},
-		},
+		"currentTime": m.startTime,
+		"media":       media,
 	}
 	logInfo("launchAndLoad: sending LOAD to %s", transportID)
 	reply, err := c.request(nsMedia, transportID, load)

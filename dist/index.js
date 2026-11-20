@@ -199,34 +199,51 @@
     }
   }
   var casting = false;
-  function localPath(url) {
+  function currentSource(url) {
     if (typeof url !== "string" || url === "") return null;
-    if (url.startsWith("file://localhost/")) return url.slice("file://localhost".length);
-    if (url.startsWith("file:///")) return url.slice("file://".length);
-    return url.startsWith("/") ? url : null;
+    if (url.startsWith("file://localhost/")) return { path: url.slice("file://localhost".length) };
+    if (url.startsWith("file:///")) return { path: url.slice("file://".length) };
+    if (url.startsWith("/")) return { path: url };
+    if (/^https?:\/\//i.test(url)) return { url };
+    return null;
+  }
+  function numberOrZero(get) {
+    try {
+      const n = get();
+      return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
+    } catch (e) {
+      return 0;
+    }
   }
   function castCurrent(device) {
     const url = core.status.url;
-    const path = localPath(url);
+    const source = currentSource(url);
     if (!device) {
       core.osd("Chromecast: device address not found");
       return;
     }
-    if (!path) {
-      IINAConsole.log(`Cannot cast, not a local file: ${JSON.stringify(url)}`);
-      core.osd(url ? "Chromecast: only local files can be cast" : "Chromecast: no file is open");
+    if (!source) {
+      IINAConsole.log(`Cannot cast this source: ${JSON.stringify(url)}`);
+      core.osd(url ? "Chromecast: this source cannot be cast" : "Chromecast: no file is open");
       return;
     }
     IINAConsole.log("Casting current media to ", device);
+    core.osd("Chromecast: connecting\u2026");
     global.postMessage("cast:load", {
       device,
-      path,
-      contentType: "video/mp4",
-      title: core.status.title || "IINA"
+      ...source,
+      title: core.status.title || "IINA",
+      start: numberOrZero(() => mpv.getNumber("time-pos")),
+      aid: numberOrZero(() => mpv.getNumber("aid"))
     });
     casting = true;
     core.pause();
   }
+  global.onMessage("cast:result", (r) => {
+    if (!casting) return;
+    if (!r.ok) casting = false;
+    core.osd(`Chromecast: ${r.message}`);
+  });
   function stopCasting() {
     if (!casting) return;
     casting = false;
