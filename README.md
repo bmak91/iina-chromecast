@@ -15,9 +15,15 @@ Restart IINA, open a local video, and pick your device under the plugin menu's
 *Chromecast* entry.
 
 Conversion needs ffmpeg. If it is missing when you cast something that has to be
-converted, the plugin asks whether to install it with Homebrew (`brew install ffmpeg`)
-and starts casting when the install is done. Without ffmpeg only files the device
-plays natively (MP4 with H.264/AAC, WebM, common audio files) can be cast.
+converted, the plugin tells you and offers to open the ffmpeg download page. Either:
+
+- run `brew install ffmpeg`, or
+- download the macOS build linked from <https://ffmpeg.org/download.html>, unzip it
+  and leave the `ffmpeg` file in your Downloads folder. The helper clears the
+  macOS quarantine mark on that one file so it can run.
+
+Then cast again; no restart is needed. Without ffmpeg only files the device plays
+natively (MP4 with H.264/AAC, WebM, common audio files) can be cast.
 
 The first time you cast, macOS may ask whether `casthelper` may accept incoming
 connections: allow it, the TV has to fetch the video from your Mac.
@@ -30,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: cd23796048a7a891d525dac499d5ebfc2bea9cbd2631a2ed725f0f20f8c29f04
+# expected: 2eaa9aea1e0ac84a8e98cc0585d78752fa9835b367ae15466bf5dad31e66d83e
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -40,8 +46,12 @@ To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
 
 ## How it works
 
-- `src/index.ts` (per player window) finds devices with `/usr/bin/dns-sd` and adds a
-  *Chromecast* entry to the plugin menu.
+- `src/index.ts` (per player window) adds a *Chromecast* entry to the plugin menu and
+  keeps it in sync with the helper's device list. *Stop Casting* is enabled only
+  while casting.
+- Discovery: the helper sends one multicast DNS question for Cast devices and reads
+  the answers itself, so devices show up in well under a second. The original
+  `/usr/bin/dns-sd` scan (several seconds per run) remains as a fallback.
 - `src/global.ts` starts `casthelper` once and relays commands to it.
 - `go-casthelper/` speaks the Cast protocol and serves the media to the device over HTTP.
 
@@ -72,6 +82,7 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
 | – | ffmpeg is started with an argument array (no shell) and a protocol whitelist: a network stream cannot make it open local files, and a local file cannot make it reach the network. |
 | `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `show-alert`, `network-request`, `file-system`. |
 | A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | Logs go to stderr at info level. `-log` is opt-in and creates the file `0600`. |
+| Device replies on the LAN were only read through `dns-sd`. | The helper parses mDNS replies itself: bounds-checked, fuzzed, and it ignores devices that claim a non-private address. |
 | No way to stop casting from IINA. | *Stop Casting* menu item. Casting also stops when the window closes. |
 
 ## Known limits

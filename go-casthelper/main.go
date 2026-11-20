@@ -52,10 +52,12 @@ type app struct {
 	mediaPort   string // port the media server binds to
 	mediaBindIP string // optional override for the media bind/advertise address
 
-	tools          *tools             // ffmpeg/ffprobe, nil if not installed
-	ffmpegOverride string             // -ffmpeg flag
-	convCancel     context.CancelFunc // stops the running conversion, if any
-	convSeq        uint64
+	tools          *tools // ffmpeg/ffprobe, nil if not installed
+	ffmpegOverride string // -ffmpeg flag
+
+	discovery  discovery          // Cast devices seen on the LAN
+	convCancel context.CancelFunc // stops the running conversion, if any
+	convSeq    uint64
 
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
@@ -85,7 +87,13 @@ func main() {
 	verbosity := flag.Int("v", lvlInfo, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
 	logPath := flag.String("log", "", "also append logs to this file (created 0600; default: stderr only)")
 	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: look in the usual install locations)")
+	ffmpegDirs := flag.String("ffmpeg-dirs", "", "colon-separated extra folders to look for a manually downloaded ffmpeg")
 	flag.Parse()
+	for _, d := range strings.Split(*ffmpegDirs, ":") {
+		if filepath.IsAbs(d) {
+			userToolDirs = append(userToolDirs, filepath.Clean(d))
+		}
+	}
 
 	setupLogging(*logPath, *verbosity)
 	logInfo("=== casthelper starting: pid=%d ===", os.Getpid())
@@ -199,6 +207,9 @@ func (a *app) controlMux() http.Handler {
 	mux.HandleFunc("/pause", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PAUSE", func(c *castConn) error { return c.pause() }))))
 	mux.HandleFunc("/stop", a.logged("ctrl", a.guard(http.MethodPost, a.handleStop)))
 	mux.HandleFunc("/seek", a.logged("ctrl", a.guard(http.MethodPost, a.handleSeek)))
+	mux.HandleFunc("/devices", a.logged("ctrl", a.guard(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"devices": a.discovery.list()})
+	})))
 	mux.HandleFunc("/status", a.logged("ctrl", a.guard(http.MethodGet, a.handleStatus)))
 	mux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)

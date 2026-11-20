@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -420,5 +421,157 @@ func TestNetworkStreamCannotMakeFFmpegReadLocalFiles(t *testing.T) {
 	resp := do(t, "POST", srv.URL+"/cast", `{"device":"192.168.1.2","url":"`+origin.URL+`/x.m3u8"}`, map[string]string{"X-Cast-Token": "secret-token"})
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Errorf("playlist pointing at a local file: got %d, want 422", resp.StatusCode)
+	}
+}
+
+func TestProbeWorksWithoutFFprobe(t *testing.T) {
+	tl := testTools(t)
+	movie := makeSample(t, tl, "movie.mkv", "-c:v", "libx265", "-preset", "ultrafast", "-c:a", "ac3")
+	plain := makeSample(t, tl, "movie.mp4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac")
+	noProbe := *tl
+	noProbe.ffprobe = ""
+
+	for _, f := range []string{movie, plain} {
+		src := source{location: f}
+		want, err := tl.probe(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := noProbe.probe(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pw, pg := decide(src, want, 0), decide(src, got, 0)
+		if (pw == nil) != (pg == nil) {
+			t.Fatalf("%s: plan with ffprobe %+v, without %+v", filepath.Base(f), pw, pg)
+		}
+		if pw != nil && (pw.copyVideo != pg.copyVideo || pw.hasVideo != pg.hasVideo || pg.duration < 3) {
+			t.Errorf("%s: plan with ffprobe %+v, without %+v", filepath.Base(f), pw, pg)
+		}
+	}
+}
+
+func TestManuallyDownloadedFFmpegIsFound(t *testing.T) {
+	tl := testTools(t)
+	dir := t.TempDir()
+	data, err := os.ReadFile(tl.ffmpeg)
+	if err != nil {
+		t.Skip(err)
+	}
+	// As unzipped from a download: present but not marked executable.
+	os.WriteFile(filepath.Join(dir, "ffmpeg"), data, 0o644)
+
+	saved, savedUser := toolDirs, userToolDirs
+	toolDirs, userToolDirs = nil, []string{dir}
+	t.Setenv("PATH", "")
+	t.Cleanup(func() { toolDirs, userToolDirs = saved, savedUser })
+
+	got := findTools("")
+	if got == nil || got.ffmpeg != filepath.Join(dir, "ffmpeg") || got.ffprobe != "" {
+		t.Fatalf("findTools = %+v, want the downloaded ffmpeg without ffprobe", got)
+	}
+}
+
+// dnsName encodes a name as DNS labels.
+func dnsName(s string) []byte {
+	var b []byte
+	for _, l := range strings.Split(strings.TrimSuffix(s, "."), ".") {
+		b = append(b, byte(len(l)))
+		b = append(b, l...)
+	}
+	return append(b, 0)
+}
+
+func dnsRecord(name string, typ uint16, data []byte) []byte {
+	b := dnsName(name)
+	b = binary.BigEndian.AppendUint16(b, typ)
+	b = binary.BigEndian.AppendUint16(b, 1)
+	b = binary.BigEndian.AppendUint32(b, 120)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(data)))
+	return append(b, data...)
+}
+
+// castReply builds the mDNS answer a Cast device sends.
+func castReply(instance, host, friendly, model string, port uint16, ip [4]byte) []byte {
+	pkt := []byte{0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 3}
+	full := instance + "._googlecast._tcp.local."
+	pkt = append(pkt, dnsRecord("_googlecast._tcp.local.", 12, dnsName(full))...)
+	txt := []byte{}
+	for _, kv := range []string{"id=abc123", "md=" + model, "fn=" + friendly} {
+		txt = append(txt, byte(len(kv)))
+		txt = append(txt, kv...)
+	}
+	pkt = append(pkt, dnsRecord(full, 16, txt)...)
+	srv := binary.BigEndian.AppendUint16([]byte{0, 0, 0, 0}, port)
+	pkt = append(pkt, dnsRecord(full, 33, append(srv, dnsName(host)...))...)
+	pkt = append(pkt, dnsRecord(host, 1, ip[:])...)
+	return pkt
+}
+
+func TestParseCastReply(t *testing.T) {
+	pkt := castReply("Freebox-Player-POP-1234", "fbx.local.", "Freebox Player POP", "Freebox Player POP", 8009, [4]byte{192, 168, 1, 50})
+	devs := parseResponse(pkt, netip.MustParseAddr("192.168.1.50"))
+	if len(devs) != 1 || devs[0].Name != "Freebox Player POP" || devs[0].IP != "192.168.1.50" || devs[0].Port != 8009 || devs[0].ID != "abc123" {
+		t.Fatalf("parsed %+v", devs)
+	}
+	// A reply that claims a public address is ignored.
+	pkt = castReply("x", "x.local.", "Evil", "m", 8009, [4]byte{8, 8, 8, 8})
+	if devs := parseResponse(pkt, netip.MustParseAddr("192.168.1.66")); len(devs) != 0 {
+		t.Errorf("accepted a device with a public address: %+v", devs)
+	}
+	// Truncated packets do not panic.
+	for i := range pkt {
+		parseResponse(pkt[:i], netip.MustParseAddr("192.168.1.50"))
+	}
+}
+
+func FuzzParseResponse(f *testing.F) {
+	f.Add(castReply("a", "h.local.", "Name", "Model", 8009, [4]byte{192, 168, 1, 2}))
+	f.Add([]byte{0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0xc0, 0x0c, 0, 12, 0, 1, 0, 0, 0, 0, 0, 2, 0xc0, 0x0c})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		parseResponse(b, netip.MustParseAddr("192.168.1.2"))
+	})
+}
+
+func TestDevicesEndpointFindsADeviceQuickly(t *testing.T) {
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+
+	// A fake device answering the Cast question on loopback.
+	responder, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { responder.Close() })
+	saved := mdnsAddr
+	mdnsAddr = responder.LocalAddr().(*net.UDPAddr)
+	t.Cleanup(func() { mdnsAddr = saved })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := responder.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if !bytes.Contains(buf[:n], []byte("_googlecast")) {
+				continue
+			}
+			responder.WriteToUDP(castReply("tv", "tv.local.", "Living Room TV", "Chromecast", 8009, [4]byte{127, 0, 0, 1}), from)
+		}
+	}()
+
+	_, srv := newTestApp(t)
+	start := time.Now()
+	resp := do(t, "GET", srv.URL+"/devices", "", map[string]string{"X-Cast-Token": "secret-token"})
+	var out struct{ Devices []device }
+	json.NewDecoder(resp.Body).Decode(&out)
+	if len(out.Devices) != 1 || out.Devices[0].Name != "Living Room TV" || out.Devices[0].IP != "127.0.0.1" {
+		t.Fatalf("devices = %+v", out.Devices)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("first discovery took %s", took)
+	}
+	if r := do(t, "GET", srv.URL+"/devices", "", nil); r.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/devices without token: got %d", r.StatusCode)
 	}
 }

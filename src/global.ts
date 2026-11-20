@@ -86,6 +86,21 @@ function load(d: Record<string, any>, player?: string) {
 
 // messages arrive from each player's main entry
 global.onMessage("cast:load", (d, player) => load(d, player));
+global.onMessage("cast:devices", (_d, player) => {
+  if (!player) return;
+  const reply = (r: Record<string, any>) => global.postMessage(player, "cast:devices:list", r);
+  if (!token) {
+    reply({ ok: false });
+    return;
+  }
+  http
+    .get(`${CONTROL}/devices`, { params: {}, headers: { "X-Cast-Token": token }, data: {} })
+    .then((res) => {
+      const body = JSON.parse((res && res.text) || "{}");
+      reply({ ok: true, devices: Array.isArray(body.devices) ? body.devices : [] });
+    })
+    .catch(() => reply({ ok: false }));
+});
 global.onMessage("cast:pause", () => quiet("/pause"));
 global.onMessage("cast:play", () => quiet("/play"));
 global.onMessage("cast:seek", (d) => quiet("/seek", d));
@@ -104,9 +119,22 @@ if (!bin) {
     .then(() => startHelper(bin));
 }
 
+// Where a manually downloaded ffmpeg may be: the Downloads folder or the
+// plugin's data folder.
+function ffmpegDirs(): string {
+  return [utils.resolvePath("~/Downloads"), utils.resolvePath("@data/")]
+    .filter((p) => typeof p === "string" && p.startsWith("/"))
+    .join(":");
+}
+
 function startHelper(bin: string) {
   utils
-    .exec(bin, ["-control", "127.0.0.1:9092", "-media", ":8010"], undefined, onHelperStdout)
+    .exec(
+      bin,
+      ["-control", "127.0.0.1:9092", "-media", ":8010", "-ffmpeg-dirs", ffmpegDirs()],
+      undefined,
+      onHelperStdout
+    )
     .then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`))
     .catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
 }

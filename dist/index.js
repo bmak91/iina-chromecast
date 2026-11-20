@@ -35,11 +35,11 @@
     return s.replace(/\\(\d{3})/g, (_, d) => String.fromCharCode(parseInt(d, 10))).replace(/\\(.)/g, "$1");
   }
   function parseZone(stdout) {
-    const devices = {};
+    const devices2 = {};
     for (const line of stdout.split("\n")) {
       let m = line.match(/^(\S+)\s+SRV\s+\d+\s+\d+\s+(\d+)\s+(\S+)/);
       if (m) {
-        const d = devices[m[1]] || (devices[m[1]] = {});
+        const d = devices2[m[1]] || (devices2[m[1]] = {});
         d.port = parseInt(m[2], 10);
         d.hostname = m[3].replace(/\.$/, "");
         d.instanceName = unescapeDNSLabel(m[1].split(/(?<!\\)\./)[0]);
@@ -47,7 +47,7 @@
       }
       m = line.match(/^(\S+)\s+TXT\s+(.*)$/);
       if (m) {
-        const d = devices[m[1]] || (devices[m[1]] = {});
+        const d = devices2[m[1]] || (devices2[m[1]] = {});
         const txt = d.txt || (d.txt = {});
         const pairs = m[2].match(/"([^"]*)"/g) || [];
         for (const raw of pairs) {
@@ -61,7 +61,7 @@
         }
       }
     }
-    return devices;
+    return devices2;
   }
   function parseIP(stdout) {
     for (const line of stdout.split("\n")) {
@@ -139,64 +139,81 @@
     menu
   } = iina;
   IINAConsole.log("Plugin is running");
-  var noDevicesFoundMenuItem = null;
-  var scanningMenuItem = null;
-  function noDevicesFoundMenu() {
-    if (noDevicesFoundMenuItem) return noDevicesFoundMenuItem;
-    noDevicesFoundMenuItem = menu.item("Chromecast", () => {
+  var devices = [];
+  var scanned = false;
+  var menuKey = "";
+  function rebuildMenu() {
+    const key = JSON.stringify([devices, casting, scanned]);
+    if (key === menuKey) return;
+    menuKey = key;
+    const root = menu.item("Chromecast", () => {
     });
-    noDevicesFoundMenuItem.addSubMenuItem(
-      menu.item("No Devices Found", () => {
-      }, {
-        enabled: false
-      })
-    );
-    return noDevicesFoundMenuItem;
-  }
-  function scanningMenu() {
-    if (scanningMenuItem) return scanningMenuItem;
-    scanningMenuItem = menu.item("Chromecast", () => {
-    });
-    scanningMenuItem.addSubMenuItem(
-      menu.item("Scanning...", () => {
-      }, {
-        enabled: false
-      })
-    );
-    return scanningMenuItem;
-  }
-  function devicesMenu(devices) {
-    let devicesMenuItem = menu.item("Chromecast", () => {
-    });
-    for (let i = 0; i < devices.length; i++) {
-      devicesMenuItem.addSubMenuItem(
-        menu.item(devices[i].name, () => {
-          castCurrent(devices[i].ip);
-        })
+    if (devices.length === 0) {
+      root.addSubMenuItem(
+        menu.item(scanned ? "No Devices Found" : "Scanning...", () => {
+        }, { enabled: false })
       );
     }
-    devicesMenuItem.addSubMenuItem(menu.separator());
-    devicesMenuItem.addSubMenuItem(menu.item("Stop Casting", () => stopCasting()));
-    return devicesMenuItem;
+    for (const d of devices) {
+      root.addSubMenuItem(menu.item(d.name, () => castCurrent(d.address)));
+    }
+    root.addSubMenuItem(menu.separator());
+    root.addSubMenuItem(menu.item("Stop Casting", () => stopCasting(), { enabled: casting }));
+    menu.removeAllItems();
+    menu.addItem(root);
+    menu.forceUpdate();
+  }
+  function setDevices(list) {
+    devices = list.filter((d) => d && typeof d.name === "string" && typeof d.address === "string").sort((a, b) => a.name.localeCompare(b.name) || a.address.localeCompare(b.address));
+    scanned = true;
+    rebuildMenu();
+  }
+  function refreshDevices() {
+    global.postMessage("cast:devices", {});
+  }
+  global.onMessage("cast:devices:list", (r) => {
+    onMain(() => {
+      const list = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
+        name: String(d.name),
+        address: `${d.ip}:${d.port}`
+      }));
+      if (list.length > 0) {
+        setDevices(list);
+      } else {
+        slowScan();
+      }
+    });
+  });
+  var slowScanRunning = false;
+  var lastSlowScan = 0;
+  function slowScan() {
+    const now = Date.now();
+    if (slowScanRunning || now - lastSlowScan < 3e4) return;
+    slowScanRunning = true;
+    lastSlowScan = now;
+    discoverChromecasts().then(
+      (found) => onMain(() => {
+        slowScanRunning = false;
+        setDevices(
+          found.filter((d) => d.ip).map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
+        );
+      })
+    ).catch(() => {
+      slowScanRunning = false;
+    });
   }
   IINAEvent.on("iina.window-loaded", () => {
-    menu.removeAllItems();
-    menu.addItem(scanningMenu());
-    dynamicMenu();
-    setInterval(dynamicMenu, 3e4);
+    rebuildMenu();
+    refreshDevices();
+    setTimeout(refreshDevices, 800);
+    setTimeout(refreshDevices, 2500);
+    setInterval(refreshDevices, 5e3);
   });
-  async function dynamicMenu() {
-    IINAConsole.log("Running dynamic menu");
-    const devices = await discoverChromecasts();
-    if (devices.length > 0) {
-      menu.removeAllItems();
-      menu.addItem(devicesMenu(devices));
-    } else {
-      menu.removeAllItems();
-      menu.addItem(noDevicesFoundMenu());
-    }
-  }
   var casting = false;
+  function setCasting(on) {
+    casting = on;
+    rebuildMenu();
+  }
   function currentSource(url) {
     if (typeof url !== "string" || url === "") return null;
     if (url.startsWith("file://localhost/")) return { path: url.slice("file://localhost".length) };
@@ -240,7 +257,7 @@
   function sendCast() {
     if (!lastRequest) return;
     core.osd("Chromecast: connecting\u2026");
-    casting = true;
+    setCasting(true);
     global.postMessage("cast:load", lastRequest);
   }
   function onMain(fn) {
@@ -249,61 +266,25 @@
   global.onMessage("cast:result", (r) => {
     onMain(() => {
       if (!casting) return;
-      if (!r.ok) casting = false;
+      if (!r.ok) setCasting(false);
       core.osd(`Chromecast: ${r.message}`);
       if (r.needsFfmpeg) offerFfmpegInstall();
     });
   });
-  var BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
-  var installingFfmpeg = false;
+  var FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html";
   function offerFfmpegInstall() {
-    if (installingFfmpeg) {
-      core.osd("Chromecast: ffmpeg is still installing\u2026");
-      return;
-    }
-    const brew = BREW_PATHS.find((p) => utils2.fileInPath(p));
-    if (!brew) {
-      utils2.ask(
-        "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\nInstall Homebrew from https://brew.sh, run \u201Cbrew install ffmpeg\u201D in Terminal, then cast again."
-      );
-      return;
-    }
-    const ok = utils2.ask(
-      "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\nInstall ffmpeg now with Homebrew? It takes a few minutes; casting starts when it is done."
+    const open = utils2.ask(
+      `This video has to be converted before the TV can play it, and that needs ffmpeg.
+
+Either run \u201Cbrew install ffmpeg\u201D in Terminal, or download the macOS build from ffmpeg.org, unzip it and leave the \u201Cffmpeg\u201D file in your Downloads folder. Then cast again.
+
+Open ${FFMPEG_DOWNLOAD_URL} now?`
     );
-    if (!ok) return;
-    installingFfmpeg = true;
-    core.osd("Chromecast: installing ffmpeg, this takes a few minutes\u2026");
-    const home = utils2.resolvePath("~/").replace(/\/$/, "");
-    utils2.exec("/usr/bin/env", [
-      `HOME=${home}`,
-      "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-      "NONINTERACTIVE=1",
-      brew,
-      "install",
-      "ffmpeg"
-    ]).then(
-      (res) => onMain(() => {
-        installingFfmpeg = false;
-        if (res.status !== 0) {
-          IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2e3)}`);
-          core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-          return;
-        }
-        core.osd("Chromecast: ffmpeg installed");
-        sendCast();
-      })
-    ).catch(
-      (e) => onMain(() => {
-        installingFfmpeg = false;
-        IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
-        core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-      })
-    );
+    if (open) utils2.open(FFMPEG_DOWNLOAD_URL);
   }
   function stopCasting() {
     if (!casting) return;
-    casting = false;
+    setCasting(false);
     global.postMessage("cast:stop", {});
   }
   IINAEvent.on("iina.window-will-close", stopCasting);

@@ -1,4 +1,4 @@
-import { discoverChromecasts, DiscoverResult } from "./discover";
+import { discoverChromecasts } from "./discover";
 
 const {
   utils,
@@ -12,68 +12,107 @@ const {
 
 IINAConsole.log("Plugin is running");
 
-let noDevicesFoundMenuItem: IINA.MenuItem = null;
-let scanningMenuItem: IINA.MenuItem = null;
+// --- Devices and menu --------------------------------------------------------
+//
+// The helper keeps a live list of Cast devices (it asks the network directly,
+// which takes a fraction of a second). The plugin polls that list and only
+// falls back to the slow dns-sd scan when the helper has nothing to offer.
 
-function noDevicesFoundMenu() {
-  if (noDevicesFoundMenuItem) return noDevicesFoundMenuItem;
-  noDevicesFoundMenuItem = menu.item("Chromecast", () => {});
-  noDevicesFoundMenuItem.addSubMenuItem(
-    menu.item("No Devices Found", () => {}, {
-      enabled: false,
-    })
-  );
-  return noDevicesFoundMenuItem;
-}
+type Device = { name: string; address: string };
 
-function scanningMenu() {
-  if (scanningMenuItem) return scanningMenuItem;
-  scanningMenuItem = menu.item("Chromecast", () => {});
-  scanningMenuItem.addSubMenuItem(
-    menu.item("Scanning...", () => {}, {
-      enabled: false,
-    })
-  );
-  return scanningMenuItem;
-}
+let devices: Device[] = [];
+let scanned = false; // has any scan finished yet?
+let menuKey = "";
 
-function devicesMenu(devices: DiscoverResult[]) {
-  let devicesMenuItem = menu.item("Chromecast", () => {});
-  for (let i = 0; i < devices.length; i++) {
-    devicesMenuItem.addSubMenuItem(
-      menu.item(devices[i].name, () => {
-        castCurrent(devices[i].ip);
-      })
+function rebuildMenu() {
+  const key = JSON.stringify([devices, casting, scanned]);
+  if (key === menuKey) return;
+  menuKey = key;
+
+  const root = menu.item("Chromecast", () => {});
+  if (devices.length === 0) {
+    root.addSubMenuItem(
+      menu.item(scanned ? "No Devices Found" : "Scanning...", () => {}, { enabled: false })
     );
   }
-  devicesMenuItem.addSubMenuItem(menu.separator());
-  devicesMenuItem.addSubMenuItem(menu.item("Stop Casting", () => stopCasting()));
-  return devicesMenuItem;
+  for (const d of devices) {
+    root.addSubMenuItem(menu.item(d.name, () => castCurrent(d.address)));
+  }
+  root.addSubMenuItem(menu.separator());
+  root.addSubMenuItem(menu.item("Stop Casting", () => stopCasting(), { enabled: casting }));
+
+  menu.removeAllItems();
+  menu.addItem(root);
+  menu.forceUpdate();
+}
+
+function setDevices(list: Device[]) {
+  devices = list
+    .filter((d) => d && typeof d.name === "string" && typeof d.address === "string")
+    .sort((a, b) => a.name.localeCompare(b.name) || a.address.localeCompare(b.address));
+  scanned = true;
+  rebuildMenu();
+}
+
+function refreshDevices() {
+  global.postMessage("cast:devices", {});
+}
+
+global.onMessage("cast:devices:list", (r: { ok: boolean; devices?: any[] }) => {
+  onMain(() => {
+    const list: Device[] = (r.ok && Array.isArray(r.devices) ? r.devices : []).map((d) => ({
+      name: String(d.name),
+      address: `${d.ip}:${d.port}`,
+    }));
+    if (list.length > 0) {
+      setDevices(list);
+    } else {
+      slowScan();
+    }
+  });
+});
+
+// Fallback: the original dns-sd based scan. It takes several seconds, so it
+// runs at most every 30 seconds and never twice at once.
+let slowScanRunning = false;
+let lastSlowScan = 0;
+
+function slowScan() {
+  const now = Date.now();
+  if (slowScanRunning || now - lastSlowScan < 30000) return;
+  slowScanRunning = true;
+  lastSlowScan = now;
+  discoverChromecasts()
+    .then((found) =>
+      onMain(() => {
+        slowScanRunning = false;
+        setDevices(
+          found
+            .filter((d) => d.ip)
+            .map((d) => ({ name: d.name, address: `${d.ip}:${d.port}` }))
+        );
+      })
+    )
+    .catch(() => {
+      slowScanRunning = false;
+    });
 }
 
 IINAEvent.on("iina.window-loaded", () => {
-  menu.removeAllItems();
-  menu.addItem(scanningMenu());
-  dynamicMenu();
-  setInterval(dynamicMenu, 30000);
+  rebuildMenu();
+  refreshDevices();
+  // The helper may still be starting; ask again shortly, then keep polling.
+  setTimeout(refreshDevices, 800);
+  setTimeout(refreshDevices, 2500);
+  setInterval(refreshDevices, 5000);
 });
 
-// Start scanning and updating menu items
-async function dynamicMenu() {
-  IINAConsole.log("Running dynamic menu");
-
-  // Start searching for devices and do it every 30 seconds
-  const devices = await discoverChromecasts();
-  if (devices.length > 0) {
-    menu.removeAllItems();
-    menu.addItem(devicesMenu(devices));
-  } else {
-    menu.removeAllItems();
-    menu.addItem(noDevicesFoundMenu());
-  }
-}
-
 let casting = false;
+
+function setCasting(on: boolean) {
+  casting = on;
+  rebuildMenu(); // enables or disables "Stop Casting"
+}
 
 // What is playing: a local file (served by the helper) or a network stream
 // (fetched and converted by the helper). core.status.url is already
@@ -125,7 +164,7 @@ let lastRequest: Record<string, any> | null = null;
 function sendCast() {
   if (!lastRequest) return;
   core.osd("Chromecast: connecting…");
-  casting = true;
+  setCasting(true);
   global.postMessage("cast:load", lastRequest);
 }
 
@@ -139,73 +178,31 @@ function onMain(fn: () => void) {
 global.onMessage("cast:result", (r: { ok: boolean; message: string; needsFfmpeg?: boolean }) => {
   onMain(() => {
     if (!casting) return;
-    if (!r.ok) casting = false;
+    if (!r.ok) setCasting(false);
     core.osd(`Chromecast: ${r.message}`);
     if (r.needsFfmpeg) offerFfmpegInstall();
   });
 });
 
-// ffmpeg does the conversion. If it is missing, offer to install it with
-// Homebrew (after asking), then retry the cast.
-const BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
-let installingFfmpeg = false;
+// ffmpeg does the conversion. If it is missing, say how to get it and offer to
+// open its download page. The helper also looks for a downloaded "ffmpeg" in
+// the Downloads folder.
+const FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html";
 
 function offerFfmpegInstall() {
-  if (installingFfmpeg) {
-    core.osd("Chromecast: ffmpeg is still installing…");
-    return;
-  }
-  const brew = BREW_PATHS.find((p) => utils.fileInPath(p));
-  if (!brew) {
-    utils.ask(
-      "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\n" +
-        "Install Homebrew from https://brew.sh, run “brew install ffmpeg” in Terminal, then cast again."
-    );
-    return;
-  }
-  const ok = utils.ask(
+  const open = utils.ask(
     "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\n" +
-      "Install ffmpeg now with Homebrew? It takes a few minutes; casting starts when it is done."
+      "Either run “brew install ffmpeg” in Terminal, or download the macOS build from " +
+      "ffmpeg.org, unzip it and leave the “ffmpeg” file in your Downloads folder. " +
+      "Then cast again.\n\n" +
+      `Open ${FFMPEG_DOWNLOAD_URL} now?`
   );
-  if (!ok) return;
-
-  installingFfmpeg = true;
-  core.osd("Chromecast: installing ffmpeg, this takes a few minutes…");
-  // IINA starts programs with an empty environment; Homebrew needs HOME and PATH.
-  const home = utils.resolvePath("~/").replace(/\/$/, "");
-  utils
-    .exec("/usr/bin/env", [
-      `HOME=${home}`,
-      "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-      "NONINTERACTIVE=1",
-      brew,
-      "install",
-      "ffmpeg",
-    ])
-    .then((res) =>
-      onMain(() => {
-        installingFfmpeg = false;
-        if (res.status !== 0) {
-          IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2000)}`);
-          core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-          return;
-        }
-        core.osd("Chromecast: ffmpeg installed");
-        sendCast();
-      })
-    )
-    .catch((e) =>
-      onMain(() => {
-        installingFfmpeg = false;
-        IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
-        core.osd("Chromecast: could not install ffmpeg, see the plugin log");
-      })
-    );
+  if (open) utils.open(FFMPEG_DOWNLOAD_URL);
 }
 
 function stopCasting() {
   if (!casting) return;
-  casting = false;
+  setCasting(false);
   global.postMessage("cast:stop", {});
 }
 

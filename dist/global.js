@@ -65,6 +65,18 @@
     });
   }
   global.onMessage("cast:load", (d, player) => load(d, player));
+  global.onMessage("cast:devices", (_d, player) => {
+    if (!player) return;
+    const reply = (r) => global.postMessage(player, "cast:devices:list", r);
+    if (!token) {
+      reply({ ok: false });
+      return;
+    }
+    http.get(`${CONTROL}/devices`, { params: {}, headers: { "X-Cast-Token": token }, data: {} }).then((res) => {
+      const body = JSON.parse(res && res.text || "{}");
+      reply({ ok: true, devices: Array.isArray(body.devices) ? body.devices : [] });
+    }).catch(() => reply({ ok: false }));
+  });
   global.onMessage("cast:pause", () => quiet("/pause"));
   global.onMessage("cast:play", () => quiet("/play"));
   global.onMessage("cast:seek", (d) => quiet("/seek", d));
@@ -75,7 +87,15 @@
     IINAConsole.log("Starting casthelper");
     utils.exec("/usr/bin/xattr", ["-d", "com.apple.quarantine", bin]).catch(() => void 0).then(() => startHelper(bin));
   }
+  function ffmpegDirs() {
+    return [utils.resolvePath("~/Downloads"), utils.resolvePath("@data/")].filter((p) => typeof p === "string" && p.startsWith("/")).join(":");
+  }
   function startHelper(bin2) {
-    utils.exec(bin2, ["-control", "127.0.0.1:9092", "-media", ":8010"], void 0, onHelperStdout).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
+    utils.exec(
+      bin2,
+      ["-control", "127.0.0.1:9092", "-media", ":8010", "-ffmpeg-dirs", ffmpegDirs()],
+      void 0,
+      onHelperStdout
+    ).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
   }
 })();

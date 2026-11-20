@@ -3,7 +3,7 @@
 A zero-dependency Go helper for the IINA Chromecast plugin. It does the two jobs
 IINA's JS plugin sandbox can't: serve the local file to the device over HTTP
 (with Range support, so seeking works) and speak the Cast v2 protocol
-(TLS + length-prefixed protobuf). Discovery stays in the plugin via macOS's `dns-sd`.
+(TLS + length-prefixed protobuf). It also finds devices with a multicast DNS query.
 
 Build and install it with `../install-helper.sh`.
 
@@ -20,6 +20,7 @@ that token in an `X-Cast-Token` header. Requests carrying an `Origin` header or 
 | POST   | /pause  | –                                      | pause                        |
 | POST   | /seek   | `{time}` (seconds)                     | seek                         |
 | POST   | /stop   | –                                      | stop + tear down the session |
+| GET    | /devices | –                                     | Cast devices found on the LAN |
 | GET    | /status | –                                      | session state                |
 
 `/cast` takes `{device, path | url, title, start, aid}`. `device` must be a private

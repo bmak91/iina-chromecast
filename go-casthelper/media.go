@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,15 @@ type tools struct {
 
 var toolDirs = []string{"/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"}
 
+// userToolDirs are extra places to look for a manually downloaded ffmpeg, such
+// as the user's Downloads folder (set with -ffmpeg-dirs).
+var userToolDirs []string
+
+func isExecutableFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0
+}
+
 func findTool(name, override string) string {
 	if override != "" {
 		if st, err := os.Stat(override); err == nil && st.Mode().IsRegular() {
@@ -48,15 +58,38 @@ func findTool(name, override string) string {
 		return ""
 	}
 	for _, d := range toolDirs {
-		p := filepath.Join(d, name)
-		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
+		if p := filepath.Join(d, name); isExecutableFile(p) {
 			return p
 		}
 	}
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
+	for _, d := range userToolDirs {
+		p := filepath.Join(d, name)
+		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
+			allowDownloadedTool(p)
+			if isExecutableFile(p) {
+				return p
+			}
+		}
+	}
 	return ""
+}
+
+// allowDownloadedTool prepares an ffmpeg the user downloaded by hand: browsers
+// mark downloads as quarantined, and macOS then refuses to run them because
+// they are not notarized. The user put the file there for this purpose, so
+// clear the mark on that one file and make sure it is executable.
+func allowDownloadedTool(p string) {
+	if _, err := os.Stat("/usr/bin/xattr"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = exec.CommandContext(ctx, "/usr/bin/xattr", "-d", "com.apple.quarantine", p).Run()
+	}
+	if st, err := os.Stat(p); err == nil && st.Mode()&0o111 == 0 {
+		_ = os.Chmod(p, st.Mode()|0o755)
+	}
 }
 
 func findTools(ffmpegOverride string) *tools {
@@ -64,21 +97,22 @@ func findTools(ffmpegOverride string) *tools {
 	if t.ffmpeg == "" {
 		return nil
 	}
-	t.ffprobe = findTool("ffprobe", "")
-	if p := filepath.Join(filepath.Dir(t.ffmpeg), "ffprobe"); t.ffprobe == "" || ffmpegOverride != "" {
-		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
-			t.ffprobe = p
-		}
-	}
-	if t.ffprobe == "" {
-		return nil
+	// ffprobe is optional: a manual download often has ffmpeg only.
+	if p := filepath.Join(filepath.Dir(t.ffmpeg), "ffprobe"); isExecutableFile(p) {
+		t.ffprobe = p
+	} else if ffmpegOverride == "" {
+		t.ffprobe = findTool("ffprobe", "")
 	}
 
 	// Prefer the Mac's hardware encoder; fall back to software x264.
 	t.videoEncoder = []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "21"}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, t.ffmpeg, "-hide_banner", "-encoders").Output()
+	out, err := exec.CommandContext(ctx, t.ffmpeg, "-hide_banner", "-encoders").Output()
+	if err != nil {
+		logError("ffmpeg at %s cannot be run: %v", t.ffmpeg, err)
+		return nil
+	}
 	if bytes.Contains(out, []byte("h264_videotoolbox")) {
 		t.videoEncoder = []string{"-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "1"}
 	}
@@ -121,7 +155,60 @@ type probeResult struct {
 	} `json:"format"`
 }
 
+var (
+	inputRE    = regexp.MustCompile(`(?m)^Input #0, (.+), from `)
+	durationRE = regexp.MustCompile(`(?m)^\s*Duration: (\d+):(\d+):(\d+(?:\.\d+)?)`)
+	streamRE   = regexp.MustCompile(`(?m)^\s*Stream #0:\d+.*?: (Video|Audio): (\w+)(?:\s*\([^)]*\))*(?:, (\w+))?(.*)$`)
+)
+
+// probeWithFFmpeg reads the same facts from the banner `ffmpeg -i` prints,
+// for installs that have no ffprobe.
+func (t *tools) probeWithFFmpeg(src source) (*probeResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, t.ffmpeg, "-hide_banner", "-nostdin",
+		"-protocol_whitelist", protocolWhitelist(src.isURL), "-i", src.location)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run() // always "fails": no output file is given
+	out := stderr.String()
+
+	var r probeResult
+	m := inputRE.FindStringSubmatch(out)
+	if m == nil {
+		return nil, fmt.Errorf("ffmpeg: %s", truncate(out, 300))
+	}
+	r.Format.FormatName = m[1]
+	if d := durationRE.FindStringSubmatch(out); d != nil {
+		h, _ := strconv.ParseFloat(d[1], 64)
+		mi, _ := strconv.ParseFloat(d[2], 64)
+		s, _ := strconv.ParseFloat(d[3], 64)
+		r.Format.Duration = strconv.FormatFloat(h*3600+mi*60+s, 'f', 3, 64)
+	}
+	for _, s := range streamRE.FindAllStringSubmatch(out, -1) {
+		st := struct {
+			CodecType   string `json:"codec_type"`
+			CodecName   string `json:"codec_name"`
+			PixFmt      string `json:"pix_fmt"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
+		}{CodecType: strings.ToLower(s[1]), CodecName: s[2]}
+		if st.CodecType == "video" {
+			st.PixFmt = s[3]
+			if strings.Contains(s[4], "(attached pic)") {
+				st.Disposition.AttachedPic = 1
+			}
+		}
+		r.Streams = append(r.Streams, st)
+	}
+	return &r, nil
+}
+
 func (t *tools) probe(src source) (*probeResult, error) {
+	if t.ffprobe == "" {
+		return t.probeWithFFmpeg(src)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, t.ffprobe,
