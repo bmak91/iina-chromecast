@@ -134,6 +134,7 @@ function setDevices(list: Device[]) {
 
 let ticks = 0;
 let emptyAnswers = 0;
+let lastProblem = "";
 
 function tick() {
   ticks += 1;
@@ -147,9 +148,9 @@ function tick() {
     else if (!r.ok) log(`${r.kind} failed:`, r.status, r.text.trim());
   }
 
-  // 2. Ask for the device list: every second at first so the menu fills in
-  //    quickly, then every four seconds.
-  if (ticks <= 6 || ticks % 4 === 0) ask("devices", "get", "/devices");
+  // 2. Ask for the device list: every second until a device shows up, so the
+  //    menu fills in quickly, then every four seconds.
+  if (devices.length === 0 || ticks % 4 === 0) ask("devices", "get", "/devices");
 }
 
 function onDevices(r: Reply) {
@@ -168,9 +169,15 @@ function onDevices(r: Reply) {
     name: String(d.name),
     address: `${d.ip}:${d.port}`,
   }));
-  // The first answers can come before any device has replied; don't flash
-  // "No Devices Found" during the first seconds.
-  if (list.length > 0 || ticks > 4) setDevices(list);
+  // The first answers can come before any device has replied, and macOS can
+  // refuse the helper's network query for a while after it starts. Keep
+  // showing "Scanning..." through that instead of "No Devices Found".
+  const problem = typeof body.problem === "string" ? body.problem : "";
+  if (problem !== lastProblem) {
+    lastProblem = problem;
+    log(problem ? `discovery problem: ${problem}` : "discovery is working");
+  }
+  if (list.length > 0 || ticks > (problem ? 45 : 8)) setDevices(list);
 
   // The session ended on the device (stopped with the TV remote, TV off...).
   if (body.casting === false && casting && castConfirmed) {

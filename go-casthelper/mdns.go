@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -42,6 +43,7 @@ type discovery struct {
 	lastScan time.Time
 	scanning bool
 	done     chan struct{} // closed when the running scan ends
+	problem  string        // why the last scan could not ask the network, "" if it could
 }
 
 const (
@@ -50,6 +52,13 @@ const (
 	deviceTTL    = 45 * time.Second        // forget devices not seen for this long
 	maxDevices   = 64
 )
+
+// status says why devices cannot be looked for, or "" if they can.
+func (d *discovery) status() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.problem
+}
 
 // list returns the known devices, starting a scan if the last one is stale.
 // The first call waits briefly so the caller gets devices right away.
@@ -94,11 +103,34 @@ func (d *discovery) list() []device {
 }
 
 func (d *discovery) scan(done chan struct{}) {
+	var sent atomic.Int32
+	var lastErr atomic.Value
 	defer func() {
 		d.mu.Lock()
 		d.scanning = false
 		d.lastScan = time.Now()
+		was := d.problem
+		d.problem = ""
+		if sent.Load() == 0 {
+			// The question never left this Mac. macOS does this for the first
+			// seconds after a program starts, and for as long as the app has
+			// no permission to use the local network. Try again soon instead
+			// of waiting out the normal interval.
+			d.problem = "cannot reach the local network"
+			if e, ok := lastErr.Load().(string); ok {
+				d.problem += ": " + e
+			}
+			d.lastScan = time.Now().Add(-scanInterval + time.Second)
+		}
+		now := d.problem
 		d.mu.Unlock()
+		if now != was {
+			if now != "" {
+				logWarn("discovery: %s", now)
+			} else {
+				logInfo("discovery: the local network is reachable")
+			}
+		}
 		close(done)
 	}()
 
@@ -109,7 +141,10 @@ func (d *discovery) scan(done chan struct{}) {
 		go func(local net.IP) {
 			defer wg.Done()
 			if err := queryOnce(local, found); err != nil {
-				logDebug("discovery: query from %s failed: %v", local, err)
+				lastErr.Store(err.Error())
+				logTrace("discovery: query from %s failed: %v", local, err)
+			} else {
+				sent.Add(1)
 			}
 		}(local)
 	}

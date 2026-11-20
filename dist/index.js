@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.6.0",
+    version: "0.6.1",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 20
+    ghVersion: 21
   };
 
   // src/log.ts
@@ -188,6 +188,7 @@ ${v.stack || ""}`;
   }
   var ticks = 0;
   var emptyAnswers = 0;
+  var lastProblem = "";
   function tick() {
     ticks += 1;
     while (inbox.length > 0) {
@@ -197,7 +198,7 @@ ${v.stack || ""}`;
       else if (r.kind === "toggle") onToggled(r);
       else if (!r.ok) log(`${r.kind} failed:`, r.status, r.text.trim());
     }
-    if (ticks <= 6 || ticks % 4 === 0) ask("devices", "get", "/devices");
+    if (devices.length === 0 || ticks % 4 === 0) ask("devices", "get", "/devices");
   }
   function onDevices(r) {
     if (!r.ok) {
@@ -214,7 +215,12 @@ ${v.stack || ""}`;
       name: String(d.name),
       address: `${d.ip}:${d.port}`
     }));
-    if (list.length > 0 || ticks > 4) setDevices(list);
+    const problem = typeof body.problem === "string" ? body.problem : "";
+    if (problem !== lastProblem) {
+      lastProblem = problem;
+      log(problem ? `discovery problem: ${problem}` : "discovery is working");
+    }
+    if (list.length > 0 || ticks > (problem ? 45 : 8)) setDevices(list);
     if (body.casting === false && casting && castConfirmed) {
       log("the helper reports the session has ended");
       endCasting();

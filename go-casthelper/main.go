@@ -55,8 +55,10 @@ type app struct {
 	tools          *tools // ffmpeg/ffprobe, nil if not installed
 	ffmpegOverride string // -ffmpeg flag
 
-	discovery discovery  // Cast devices seen on the LAN
-	conv      *converter // running conversion, if any
+	discovery discovery // Cast devices seen on the LAN
+
+	quit chan os.Signal // receives the signal that ends the helper
+	conv *converter     // running conversion, if any
 
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
@@ -138,6 +140,7 @@ func main() {
 		mediaPort:      mediaPort,
 		mediaBindIP:    bindIP,
 		tools:          findTools(*ffmpegPath),
+		quit:           make(chan os.Signal, 4),
 		ffmpegOverride: *ffmpegPath,
 	}
 	if a.tools == nil {
@@ -146,7 +149,7 @@ func main() {
 		logInfo("using %s for conversion", a.tools.ffmpeg)
 	}
 
-	takeOverFrom(*pidFile, *controlAddr)
+	takeOverFrom(*pidFile, *tokenFile, *controlAddr)
 
 	ctrlLn, err := net.Listen("tcp", *controlAddr)
 	if err != nil {
@@ -182,7 +185,7 @@ func main() {
 	fmt.Printf("READY %s\n", token)
 	logInfo("wrote READY to stdout; waiting for control requests")
 
-	sig := make(chan os.Signal, 1)
+	sig := a.quit
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go watchParent(sig)
 	s := <-sig
@@ -220,6 +223,15 @@ func (a *app) controlMux() http.Handler {
 	mux.HandleFunc("/cast", a.logged("ctrl", a.guard(http.MethodPost, a.handleCast)))
 	mux.HandleFunc("/play", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PLAY", func(c *castConn) error { return c.play() }))))
 	mux.HandleFunc("/pause", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PAUSE", func(c *castConn) error { return c.pause() }))))
+	mux.HandleFunc("/quit", a.logged("ctrl", a.guard(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		// A newer helper (after a plugin reload) asks this one to make room.
+		logInfo("asked to quit by a newer helper")
+		writeJSON(w, map[string]any{"ok": true})
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			a.quit <- syscall.SIGTERM
+		}()
+	})))
 	mux.HandleFunc("/toggle", a.logged("ctrl", a.guard(http.MethodPost, a.handleToggle)))
 	mux.HandleFunc("/stop", a.logged("ctrl", a.guard(http.MethodPost, a.handleStop)))
 	mux.HandleFunc("/seek", a.logged("ctrl", a.guard(http.MethodPost, a.handleSeek)))
@@ -227,7 +239,8 @@ func (a *app) controlMux() http.Handler {
 		a.mu.Lock()
 		casting := a.cast != nil
 		a.mu.Unlock()
-		writeJSON(w, map[string]any{"devices": a.discovery.list(), "casting": casting})
+		list := a.discovery.list()
+		writeJSON(w, map[string]any{"devices": list, "casting": casting, "problem": a.discovery.status()})
 	})))
 	mux.HandleFunc("/status", a.logged("ctrl", a.guard(http.MethodGet, a.handleStatus)))
 	mux.HandleFunc("/", a.logged("ctrl", func(w http.ResponseWriter, r *http.Request) {

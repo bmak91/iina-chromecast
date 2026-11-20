@@ -3,7 +3,7 @@
   var Info_default = {
     name: "IINA Chromecast",
     identifier: "com.bmak91.iina-chromecast",
-    version: "0.6.0",
+    version: "0.6.1",
     description: "Chromecast support for IINA",
     author: {
       name: "Deepak Mittal",
@@ -22,7 +22,7 @@
       "127.0.0.1"
     ],
     ghRepo: "bmak91/iina-chromecast",
-    ghVersion: 20
+    ghVersion: 21
   };
 
   // src/log.ts
