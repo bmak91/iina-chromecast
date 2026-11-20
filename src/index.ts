@@ -136,7 +136,6 @@ IINAEvent.on("iina.window-loaded", () => {
 // paused and muted, and play/pause and seeking are sent to the device.
 let casting = false;
 let castConfirmed = false; // the device accepted the media
-let tvPaused = false;
 let wasMuted = false;
 
 function setCasting(on: boolean) {
@@ -152,7 +151,6 @@ function beginCasting() {
     } catch (e) {}
   }
   castConfirmed = false;
-  tvPaused = false;
   setCasting(true);
   core.pause();
 }
@@ -262,9 +260,16 @@ IINAEvent.on("mpv.pause.changed", () => {
   if (!casting) return;
   if (mpv.getFlag("pause")) return; // our own pause, nothing to do
   core.pause();
-  tvPaused = !tvPaused;
-  global.postMessage(tvPaused ? "cast:pause" : "cast:play", {});
-  core.osd(tvPaused ? "Chromecast: paused" : "Chromecast: playing");
+  // The helper knows the device's real state (it may have been paused with
+  // the TV remote), so it decides which way to toggle and reports back.
+  global.postMessage("cast:toggle", {});
+});
+
+global.onMessage("cast:toggled", (r: { ok: boolean; paused?: boolean }) => {
+  onMain(() => {
+    if (!casting || !r.ok) return;
+    core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
+  });
 });
 
 IINAEvent.on("mpv.seek", () => {

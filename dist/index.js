@@ -226,7 +226,6 @@
   });
   var casting = false;
   var castConfirmed = false;
-  var tvPaused = false;
   var wasMuted = false;
   function setCasting(on) {
     casting = on;
@@ -241,7 +240,6 @@
       }
     }
     castConfirmed = false;
-    tvPaused = false;
     setCasting(true);
     core.pause();
   }
@@ -330,9 +328,13 @@ Open ${FFMPEG_DOWNLOAD_URL} now?`
     if (!casting) return;
     if (mpv.getFlag("pause")) return;
     core.pause();
-    tvPaused = !tvPaused;
-    global.postMessage(tvPaused ? "cast:pause" : "cast:play", {});
-    core.osd(tvPaused ? "Chromecast: paused" : "Chromecast: playing");
+    global.postMessage("cast:toggle", {});
+  });
+  global.onMessage("cast:toggled", (r) => {
+    onMain(() => {
+      if (!casting || !r.ok) return;
+      core.osd(r.paused ? "Chromecast: paused" : "Chromecast: playing");
+    });
   });
   IINAEvent.on("mpv.seek", () => {
     if (!casting) return;

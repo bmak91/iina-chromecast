@@ -205,6 +205,7 @@ func (a *app) controlMux() http.Handler {
 	mux.HandleFunc("/cast", a.logged("ctrl", a.guard(http.MethodPost, a.handleCast)))
 	mux.HandleFunc("/play", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PLAY", func(c *castConn) error { return c.play() }))))
 	mux.HandleFunc("/pause", a.logged("ctrl", a.guard(http.MethodPost, a.simpleCmd("PAUSE", func(c *castConn) error { return c.pause() }))))
+	mux.HandleFunc("/toggle", a.logged("ctrl", a.guard(http.MethodPost, a.handleToggle)))
 	mux.HandleFunc("/stop", a.logged("ctrl", a.guard(http.MethodPost, a.handleStop)))
 	mux.HandleFunc("/seek", a.logged("ctrl", a.guard(http.MethodPost, a.handleSeek)))
 	mux.HandleFunc("/devices", a.logged("ctrl", a.guard(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
@@ -655,6 +656,33 @@ func (a *app) handleSeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.simpleCmd("SEEK", func(c *castConn) error { return c.seek(body.Time) })(w, r)
+}
+
+// handleToggle pauses or resumes depending on what the device last reported,
+// so it stays correct when playback was also paused with the TV remote.
+func (a *app) handleToggle(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	conn := a.cast
+	a.mu.Unlock()
+	if conn == nil {
+		http.Error(w, "not casting", http.StatusConflict)
+		return
+	}
+	conn.sessMu.Lock()
+	paused := conn.playerState == "PAUSED"
+	conn.sessMu.Unlock()
+	var err error
+	if paused {
+		err = conn.play()
+	} else {
+		err = conn.pause()
+	}
+	if err != nil {
+		logError("toggle: command failed: %v", err)
+		http.Error(w, "command failed", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "paused": !paused})
 }
 
 func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {

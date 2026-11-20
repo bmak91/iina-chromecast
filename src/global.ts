@@ -111,6 +111,17 @@ global.onMessage("cast:devices", (_d, player) => {
     })
     .catch(() => reply({ ok: false }));
 });
+global.onMessage("cast:toggle", (_d, player) => {
+  post("/toggle")
+    .then((res) => {
+      const paused = /"paused":\s*true/.test((res && res.text) || "");
+      toPlayer(player, "cast:toggled", { ok: true, paused });
+    })
+    .catch((e) => {
+      IINAConsole.log(`casthelper /toggle failed: ${JSON.stringify(e)}`);
+      toPlayer(player, "cast:toggled", { ok: false });
+    });
+});
 global.onMessage("cast:pause", () => quiet("/pause"));
 global.onMessage("cast:play", () => quiet("/play"));
 global.onMessage("cast:seek", (d) => quiet("/seek", d));

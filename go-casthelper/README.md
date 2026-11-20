@@ -18,6 +18,7 @@ that token in an `X-Cast-Token` header. Requests carrying an `Origin` header or 
 | POST   | /cast   | see below                              | connect, launch, LOAD        |
 | POST   | /play   | –                                      | resume                       |
 | POST   | /pause  | –                                      | pause                        |
+| POST   | /toggle | –                                     | pause or resume, whichever applies |
 | POST   | /seek   | `{time}` (seconds)                     | seek                         |
 | POST   | /stop   | –                                      | stop + tear down the session |
 | GET    | /devices | –                                     | Cast devices found on the LAN |

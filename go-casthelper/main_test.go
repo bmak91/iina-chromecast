@@ -170,7 +170,11 @@ func fakeDevice(t *testing.T) (addr string, loaded chan string) {
 						loaded <- p["media"].(map[string]any)["contentId"].(string)
 						reply(nsMedia, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"],
 							"status": []any{map[string]any{"mediaSessionId": 1, "playerState": "PLAYING"}}})
-					case "STOP", "PLAY", "PAUSE", "SEEK":
+					case "PLAY", "PAUSE":
+						state := map[string]any{"PLAY": "PLAYING", "PAUSE": "PAUSED"}[p["type"].(string)]
+						reply(m.namespace, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"],
+							"status": []any{map[string]any{"mediaSessionId": 1, "playerState": state}}})
+					case "STOP", "SEEK":
 						reply(m.namespace, map[string]any{"type": "MEDIA_STATUS", "requestId": p["requestId"], "status": []any{}})
 					}
 				}
@@ -226,6 +230,15 @@ func TestCastSessionServesOnlyTheDeviceAndStopsAfterwards(t *testing.T) {
 	a.handleMedia(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("other LAN host: got %d, want 404", rec.Code)
+	}
+
+	// Toggle follows the state the device reports: playing -> paused -> playing.
+	for _, want := range []string{`"paused":true`, `"paused":false`, `"paused":true`} {
+		r := do(t, "POST", srv.URL+"/toggle", "", tok)
+		body, _ := io.ReadAll(r.Body)
+		if r.StatusCode != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Fatalf("toggle: got %d %s, want %s", r.StatusCode, body, want)
+		}
 	}
 
 	// After /stop nothing is listening any more.
