@@ -127,7 +127,10 @@
         // Kept in the plugin's own data folder, readable only by you,
         // restarted on every launch and capped at 2 MB.
         "-log",
-        utils.resolvePath("@data/casthelper.log")
+        utils.resolvePath("@data/casthelper.log"),
+        // Lets a helper started after a plugin reload replace the old one.
+        "-pidfile",
+        utils.resolvePath("@data/casthelper.pid")
       ],
       void 0,
       onHelperStdout

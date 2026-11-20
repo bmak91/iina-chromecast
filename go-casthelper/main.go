@@ -86,6 +86,7 @@ func main() {
 	verbosity := flag.Int("v", lvlInfo, "log verbosity: 0=error 1=warn 2=info 3=debug 4=trace (protobuf wire dumps)")
 	logPath := flag.String("log", "", "also append logs to this file (created 0600; default: stderr only)")
 	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: look in the usual install locations)")
+	pidFile := flag.String("pidfile", "", "record this helper's process id here and replace an older helper found through it")
 	ffmpegDirs := flag.String("ffmpeg-dirs", "", "colon-separated extra folders to look for a manually downloaded ffmpeg")
 	flag.Parse()
 	for _, d := range strings.Split(*ffmpegDirs, ":") {
@@ -143,6 +144,8 @@ func main() {
 	} else {
 		logInfo("using %s for conversion", a.tools.ffmpeg)
 	}
+
+	takeOverFrom(*pidFile, *controlAddr)
 
 	ctrlLn, err := net.Listen("tcp", *controlAddr)
 	if err != nil {
