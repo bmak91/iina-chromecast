@@ -882,3 +882,79 @@ func TestStreamStartMatchesConvertedOutput(t *testing.T) {
 		}
 	}
 }
+
+// Pausing makes the device drop the connection and ask again on resume. The
+// same bytes must come back, from the start or from an offset, without
+// restarting the conversion.
+func TestConvertedStreamSurvivesReconnects(t *testing.T) {
+	tl := testTools(t)
+	allowLoopbackDevice = true
+	t.Cleanup(func() { allowLoopbackDevice = false })
+	a, srv := newTestApp(t)
+	a.tools = tl
+	tok := map[string]string{"X-Cast-Token": "secret-token"}
+
+	movie := makeLongSample(t, tl)
+	device, loaded := fakeDevice(t)
+	if mode := castForTest(t, a, srv, `{"device":"`+device+`","path":"`+movie+`"}`); mode != "convert" {
+		t.Fatalf("mode = %q", mode)
+	}
+	mediaURL := <-loaded
+
+	// First connection: read a little, then hang up (the pause).
+	resp, err := http.Get(mediaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 20000)
+	if _, err := io.ReadFull(resp.Body, head); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	a.mu.Lock()
+	first := a.conv
+	a.mu.Unlock()
+
+	// Resume from the start: identical bytes, same conversion.
+	status, all, _ := httpGetText(t, mediaURL)
+	if status != 200 || !strings.HasPrefix(all, string(head)) {
+		t.Fatalf("restart from 0: status %d, prefix matches: %v", status, strings.HasPrefix(all, string(head)))
+	}
+	a.mu.Lock()
+	same := a.conv == first
+	a.mu.Unlock()
+	if !same {
+		t.Errorf("reconnecting restarted the conversion")
+	}
+
+	// Resume from a byte offset.
+	req, _ := http.NewRequest("GET", mediaURL, nil)
+	req.Header.Set("Range", "bytes=12345-")
+	r2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, _ := io.ReadAll(r2.Body)
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusPartialContent || !strings.HasPrefix(r2.Header.Get("Content-Range"), "bytes 12345-") {
+		t.Errorf("ranged resume: status %d, Content-Range %q", r2.StatusCode, r2.Header.Get("Content-Range"))
+	}
+	if string(tail) != all[12345:] {
+		t.Errorf("ranged resume returned different bytes (%d vs %d)", len(tail), len(all)-12345)
+	}
+
+	// A seek (different start) does replace it.
+	if r := do(t, "POST", srv.URL+"/seek", `{"time":5}`, tok); r.StatusCode != http.StatusOK {
+		t.Fatalf("seek: %d", r.StatusCode)
+	}
+	if status, _, _ := httpGetText(t, <-loaded); status != 200 {
+		t.Fatalf("after seek: %d", status)
+	}
+	a.mu.Lock()
+	replaced := a.conv != first
+	a.mu.Unlock()
+	if !replaced {
+		t.Errorf("seeking did not start a new conversion")
+	}
+	do(t, "POST", srv.URL+"/stop", "", tok)
+}

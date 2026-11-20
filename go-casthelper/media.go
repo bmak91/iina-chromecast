@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -354,6 +353,11 @@ func (t *tools) ffmpegArgs(src source, p *plan, start float64) []string {
 			args = append(args, "-noaccurate_seek")
 		}
 	}
+	if src.isURL {
+		// A paused cast stops reading the source for a while; reconnect
+		// instead of treating a dropped source connection as the end.
+		args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30")
+	}
 	args = append(args,
 		"-protocol_whitelist", protocolWhitelist(src.isURL),
 		"-i", src.location,
@@ -385,60 +389,6 @@ func (t *tools) ffmpegArgs(src source, p *plan, start float64) []string {
 	return append(args,
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 		"-f", "mp4", "pipe:1")
-}
-
-// serveConverted streams the ffmpeg output to the device. Only one conversion
-// runs at a time: a new request (for example after a seek) replaces the old one.
-func (a *app) serveConverted(w http.ResponseWriter, r *http.Request, src source, p *plan) {
-	start := 0.0
-	if q := r.URL.Query().Get("start"); q != "" {
-		if v, err := strconv.ParseFloat(q, 64); err == nil && v > 0 {
-			start = v
-		}
-	}
-	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Accept-Ranges", "none")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if r.Method == http.MethodHead {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	a.mu.Lock()
-	if a.convCancel != nil {
-		a.convCancel()
-	}
-	a.convSeq++
-	seq := a.convSeq
-	a.convCancel = cancel
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		if a.convSeq == seq {
-			a.convCancel = nil
-		}
-		a.mu.Unlock()
-	}()
-
-	cmd := exec.CommandContext(ctx, a.tools.ffmpeg, a.tools.ffmpegArgs(src, p, start)...)
-	cmd.Stdout = w
-	var stderr bytes.Buffer
-	cmd.Stderr = &limitedWriter{w: &stderr, n: 4096}
-	cmd.WaitDelay = 2 * time.Second
-	logInfo("convert: starting ffmpeg at %.1fs (video copy=%v)", start, p.copyVideo)
-	err := cmd.Run()
-	if err != nil && ctx.Err() == nil {
-		logError("convert: ffmpeg failed: %v: %s", err, truncate(stderr.String(), 600))
-		return
-	}
-	logInfo("convert: ffmpeg stopped")
-}
-
-type limitedWriter struct {
-	w *bytes.Buffer
-	n int
 }
 
 func (l *limitedWriter) Write(b []byte) (int, error) {

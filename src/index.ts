@@ -47,6 +47,8 @@ function rebuildMenu() {
     casting ? menu.item("Stop Casting", () => stopCasting()) : disabledItem("Stop Casting")
   );
 
+  root.addSubMenuItem(menu.item("Show Helper Log", () => utils.open("@data/casthelper.log")));
+
   menu.removeAllItems();
   menu.addItem(root);
   menu.forceUpdate();

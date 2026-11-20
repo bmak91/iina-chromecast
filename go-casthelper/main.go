@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -56,9 +55,8 @@ type app struct {
 	tools          *tools // ffmpeg/ffprobe, nil if not installed
 	ffmpegOverride string // -ffmpeg flag
 
-	discovery  discovery          // Cast devices seen on the LAN
-	convCancel context.CancelFunc // stops the running conversion, if any
-	convSeq    uint64
+	discovery discovery  // Cast devices seen on the LAN
+	conv      *converter // running conversion, if any
 
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
@@ -97,6 +95,7 @@ func main() {
 	}
 
 	setupLogging(*logPath, *verbosity)
+	removeStaleConversions()
 	logInfo("=== casthelper starting: pid=%d ===", os.Getpid())
 
 	ctrlHost, _, err := net.SplitHostPort(*controlAddr)
@@ -645,9 +644,9 @@ func (a *app) endSession(conn *castConn) {
 	}
 	a.title, a.contentType, a.mediaURL, a.mediaToken = "", "", "", ""
 	a.deviceIP = netip.Addr{}
-	if a.convCancel != nil {
-		a.convCancel()
-		a.convCancel = nil
+	if a.conv != nil {
+		a.conv.stop()
+		a.conv = nil
 	}
 	a.mu.Unlock()
 	if srv != nil {

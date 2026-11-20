@@ -40,11 +40,13 @@ func setupLogging(path string, level int) {
 
 	w := io.Writer(os.Stderr)
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			logger.Printf("[ERROR] cannot open log file %s: %v (stderr only)", path, err)
 		} else {
-			w = io.MultiWriter(os.Stderr, f)
+			// Start fresh on every launch and stop at 2 MB, so the file
+			// never grows without bound.
+			w = io.MultiWriter(os.Stderr, &cappedWriter{w: f, left: 2 << 20})
 		}
 	}
 	logger.SetOutput(w)
@@ -87,4 +89,22 @@ func hexdump(b []byte, max int) string {
 		return hex.EncodeToString(b[:max]) + fmt.Sprintf("...(%d bytes total)", len(b))
 	}
 	return hex.EncodeToString(b)
+}
+
+// cappedWriter silently drops everything after its byte budget is used up.
+type cappedWriter struct {
+	w    io.Writer
+	left int
+}
+
+func (c *cappedWriter) Write(b []byte) (int, error) {
+	if c.left > 0 {
+		n := len(b)
+		if n > c.left {
+			n = c.left
+		}
+		c.w.Write(b[:n])
+		c.left -= n
+	}
+	return len(b), nil
 }

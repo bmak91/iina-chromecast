@@ -160,7 +160,14 @@ function startHelper(bin: string) {
   utils
     .exec(
       bin,
-      ["-control", "127.0.0.1:9092", "-media", ":8010", "-ffmpeg-dirs", ffmpegDirs()],
+      [
+        "-control", "127.0.0.1:9092",
+        "-media", ":8010",
+        "-ffmpeg-dirs", ffmpegDirs(),
+        // Kept in the plugin's own data folder, readable only by you,
+        // restarted on every launch and capped at 2 MB.
+        "-log", utils.resolvePath("@data/casthelper.log"),
+      ],
       undefined,
       onHelperStdout
     )

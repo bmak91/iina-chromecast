@@ -36,7 +36,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: da056a06ba5dc4de7e50b12cc0b140819d544782d239e6ac83bddfff0ff91494
+# expected: b5775a808902aace1a336f3a9299df18007a034148fd8242878420f420449444
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -64,6 +64,10 @@ The helper inspects the source with `ffprobe` and picks one of three paths:
 | MP4 (H.264 + AAC/MP3), WebM, plain audio files | Served untouched. The device seeks natively. |
 | H.264 video in another container or with other audio (typical MKV) | Video is repackaged without re-encoding, audio becomes AAC. Almost no CPU. |
 | Anything else (HEVC, 10-bit, AVI, …) | Video is re-encoded to H.264 with the Mac's hardware encoder, at up to 1080p. |
+
+Converted output is kept in a temporary file (deleted when casting stops) so the
+device can pause, drop its connection and pick up again where it was. ffmpeg is held
+back to stay less than about 50 MB ahead of what the device has fetched.
 
 Network streams (http/https URLs opened in IINA) always go through ffmpeg, because
 the device cannot reach an address that only exists on your Mac.
@@ -94,7 +98,7 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
 | The plugin downloaded an unsigned `casthelper` binary from the upstream repo's *latest* release and ran it at every IINA launch. | Nothing is downloaded at runtime. The helper ships in the repo and its build is reproducible from the source. |
 | – | ffmpeg is started with an argument array (no shell) and a protocol whitelist: a network stream cannot make it open local files, and a local file cannot make it reach the network. |
 | `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `show-alert`, `network-request`, `file-system`. |
-| A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | Logs go to stderr at info level. `-log` is opt-in and creates the file `0600`. |
+| A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | The log lives in the plugin's data folder, readable only by you (`0600`), is restarted on every launch and capped at 2 MB. *Show Helper Log* in the menu opens it. |
 | Device replies on the LAN were only read through `dns-sd`. | The helper parses mDNS replies itself: bounds-checked, fuzzed, and it ignores devices that claim a non-private address. |
 | No way to stop casting from IINA. | *Stop Casting* menu item. Casting also stops when the window closes. |
 
