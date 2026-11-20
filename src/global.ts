@@ -67,6 +67,16 @@ if (!bin) {
   IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
 } else {
   IINAConsole.log("Starting casthelper");
+  // macOS tags files IINA downloads as quarantined, and Gatekeeper then refuses
+  // to run the helper because it is not notarized by Apple. Clear that tag on
+  // our own helper (and nothing else) before starting it.
+  utils
+    .exec("/usr/bin/xattr", ["-d", "com.apple.quarantine", bin])
+    .catch(() => undefined)
+    .then(() => startHelper(bin));
+}
+
+function startHelper(bin: string) {
   utils
     .exec(bin, ["-control", "127.0.0.1:9092", "-media", ":8010"], undefined, onHelperStdout)
     .then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`))

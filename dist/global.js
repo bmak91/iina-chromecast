@@ -50,6 +50,9 @@
     IINAConsole.log("casthelper not found. Reinstall the plugin or run ./install-helper.sh.");
   } else {
     IINAConsole.log("Starting casthelper");
-    utils.exec(bin, ["-control", "127.0.0.1:9092", "-media", ":8010"], void 0, onHelperStdout).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
+    utils.exec("/usr/bin/xattr", ["-d", "com.apple.quarantine", bin]).catch(() => void 0).then(() => startHelper(bin));
+  }
+  function startHelper(bin2) {
+    utils.exec(bin2, ["-control", "127.0.0.1:9092", "-media", ":8010"], void 0, onHelperStdout).then((r) => IINAConsole.log(`casthelper exited with status ${r.status}`)).catch((e) => IINAConsole.log(`casthelper failed to start: ${e}`));
   }
 })();
