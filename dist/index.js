@@ -200,20 +200,21 @@
   }
   var casting = false;
   function localPath(url) {
-    if (!url) return null;
-    if (url.startsWith("file://")) {
-      try {
-        return decodeURIComponent(url.slice("file://".length));
-      } catch (e) {
-        return null;
-      }
-    }
+    if (typeof url !== "string" || url === "") return null;
+    if (url.startsWith("file://localhost/")) return url.slice("file://localhost".length);
+    if (url.startsWith("file:///")) return url.slice("file://".length);
     return url.startsWith("/") ? url : null;
   }
   function castCurrent(device) {
-    const path = localPath(core.status.url);
-    if (!device || !path) {
-      core.osd(device ? "Only local files can be cast" : "Device address not found");
+    const url = core.status.url;
+    const path = localPath(url);
+    if (!device) {
+      core.osd("Chromecast: device address not found");
+      return;
+    }
+    if (!path) {
+      IINAConsole.log(`Cannot cast, not a local file: ${JSON.stringify(url)}`);
+      core.osd(url ? "Chromecast: only local files can be cast" : "Chromecast: no file is open");
       return;
     }
     IINAConsole.log("Casting current media to ", device);

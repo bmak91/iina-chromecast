@@ -78,22 +78,25 @@ async function dynamicMenu() {
 let casting = false;
 
 // Only local files can be cast: the helper serves the file itself.
-function localPath(url: string | undefined): string | null {
-  if (!url) return null;
-  if (url.startsWith("file://")) {
-    try {
-      return decodeURIComponent(url.slice("file://".length));
-    } catch (e) {
-      return null;
-    }
-  }
+// core.status.url is already percent-decoded by IINA, so it must not be decoded
+// again (a "%" in the file name would break).
+function localPath(url: string | undefined | null): string | null {
+  if (typeof url !== "string" || url === "") return null;
+  if (url.startsWith("file://localhost/")) return url.slice("file://localhost".length);
+  if (url.startsWith("file:///")) return url.slice("file://".length);
   return url.startsWith("/") ? url : null;
 }
 
 function castCurrent(device: string | null) {
-  const path = localPath(core.status.url);
-  if (!device || !path) {
-    core.osd(device ? "Only local files can be cast" : "Device address not found");
+  const url = core.status.url;
+  const path = localPath(url);
+  if (!device) {
+    core.osd("Chromecast: device address not found");
+    return;
+  }
+  if (!path) {
+    IINAConsole.log(`Cannot cast, not a local file: ${JSON.stringify(url)}`);
+    core.osd(url ? "Chromecast: only local files can be cast" : "Chromecast: no file is open");
     return;
   }
   IINAConsole.log("Casting current media to ", device);
