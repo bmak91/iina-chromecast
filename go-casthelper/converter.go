@@ -84,6 +84,32 @@ func (t *tools) newConverter(src source, p *plan, start float64) (*converter, er
 	}
 	logInfo("convert: started ffmpeg at %.1fs (video copy=%v)", start, p.copyVideo)
 
+	// Every 15 seconds say how much has been produced and how much of it the
+	// device has taken. If the device keeps up with everything produced, the
+	// source (or ffmpeg) is the slow side; if a backlog builds up, the network
+	// or the device is.
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		var lastSize, lastRead int64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			c.mu.Lock()
+			size, read, done := c.size, c.maxRead, c.done
+			c.mu.Unlock()
+			logInfo("convert: produced %.1f MB (+%.2f MB/s), device fetched %.1f MB (+%.2f MB/s), backlog %.1f MB",
+				float64(size)/1e6, float64(size-lastSize)/15e6, float64(read)/1e6, float64(read-lastRead)/15e6, float64(size-read)/1e6)
+			lastSize, lastRead = size, read
+			if done && read >= size {
+				return
+			}
+		}
+	}()
+
 	go func() {
 		buf := make([]byte, 256<<10)
 		var runErr error

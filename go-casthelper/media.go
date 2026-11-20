@@ -387,6 +387,11 @@ func (t *tools) ffmpegArgs(src source, p *plan, start float64) []string {
 		args = append(args, "-vf", vf, "-pix_fmt", "yuv420p")
 	}
 	return append(args,
+		// Cut a fragment at least every half second, not only at keyframes.
+		// With keyframes many seconds apart the device would otherwise get
+		// nothing until a whole group of pictures had been read, and run dry
+		// whenever the source delivers at about playback speed.
+		"-frag_duration", "500000",
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 		"-f", "mp4", "pipe:1")
 }

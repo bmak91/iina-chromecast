@@ -294,7 +294,10 @@ func (a *app) logged(kind string, h http.HandlerFunc) http.HandlerFunc {
 		if kind == "media" {
 			shown = "/media/…"
 		}
-		logDebug("[%s#%d] --> %s %s from %s", kind, id, r.Method, shown, r.RemoteAddr)
+		quiet := r.URL.Path == "/devices" // polled every few seconds
+		if !quiet {
+			logDebug("[%s#%d] --> %s %s from %s", kind, id, r.Method, shown, r.RemoteAddr)
+		}
 
 		rec := &respRecorder{ResponseWriter: w, record: kind == "ctrl"}
 		h(rec, r)
@@ -302,7 +305,9 @@ func (a *app) logged(kind string, h http.HandlerFunc) http.HandlerFunc {
 		if rec.status == 0 {
 			rec.status = http.StatusOK
 		}
-		logDebug("[%s#%d] <-- %d (%d bytes) in %s", kind, id, rec.status, rec.n, time.Since(start).Round(time.Millisecond))
+		if !quiet {
+			logDebug("[%s#%d] <-- %d (%d bytes) in %s", kind, id, rec.status, rec.n, time.Since(start).Round(time.Millisecond))
+		}
 	}
 }
 

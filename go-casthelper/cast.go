@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,11 +40,14 @@ type castConn struct {
 	waitMu  sync.Mutex
 	waiters map[int]chan map[string]any
 
-	sessMu         sync.Mutex
-	transportID    string
-	mediaSessionID int
-	playerState    string // last playerState seen in a MEDIA_STATUS
-	idleReason     string // last idleReason seen in a MEDIA_STATUS
+	sessMu                  sync.Mutex
+	transportID             string
+	mediaSessionID          int
+	loggedState, loggedIdle string // last state written to the log
+	loggedAt                time.Time
+
+	playerState string // last playerState seen in a MEDIA_STATUS
+	idleReason  string // last idleReason seen in a MEDIA_STATUS
 
 	sent atomic.Uint64 // frames written
 	recv atomic.Uint64 // frames read
@@ -112,7 +116,9 @@ func (c *castConn) send(m castMessage) error {
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
 
 	n := c.sent.Add(1)
-	logDebug("send #%d ns=%s dest=%s len=%d payload=%s", n, shortNS(m.namespace), m.destID, len(payload), truncate(m.payloadUTF8, 600))
+	if m.namespace != nsHeartbeat {
+		logDebug("send #%d ns=%s dest=%s len=%d payload=%s", n, shortNS(m.namespace), m.destID, len(payload), truncate(m.payloadUTF8, 600))
+	}
 	if traceEnabled() {
 		logTrace("send #%d wire: %s", n, hexdump(payload, 256))
 	}
@@ -217,7 +223,13 @@ func (c *castConn) readLoop() {
 }
 
 func (c *castConn) handle(seq uint64, m castMessage) {
-	logDebug("recv #%d ns=%s src=%s dest=%s payload=%s", seq, shortNS(m.namespace), m.sourceID, m.destID, truncate(m.payloadUTF8, 600))
+	// Devices send a media status many times a second while a growing stream
+	// plays, and heartbeats every few seconds. Logging each one in full would
+	// fill the log in minutes; logMediaStatus reports the changes instead.
+	routine := m.namespace == nsHeartbeat || strings.HasPrefix(m.payloadUTF8, `{"type":"MEDIA_STATUS"`)
+	if !routine {
+		logDebug("recv #%d ns=%s src=%s dest=%s payload=%s", seq, shortNS(m.namespace), m.sourceID, m.destID, truncate(m.payloadUTF8, 600))
+	}
 
 	if m.payloadUTF8 == "" {
 		logWarn("recv #%d: message has no UTF-8 payload (binary payload or decode failure) — ignoring", seq)
@@ -314,7 +326,24 @@ func (c *castConn) logMediaStatus(seq uint64, payload map[string]any) {
 		session := c.mediaSessionID
 		c.sessMu.Unlock()
 
-		logInfo("recv #%d: MEDIA_STATUS session=%d playerState=%s currentTime=%.1fs idleReason=%q", seq, session, state, cur, idle)
+		// Report changes of state, and otherwise at most every 15 seconds.
+		buffered := 0.0
+		if media, ok := s0["media"].(map[string]any); ok {
+			if d, ok := media["duration"].(float64); ok {
+				buffered = d - cur
+			}
+		}
+		c.sessMu.Lock()
+		changed := state != c.loggedState || idle != c.loggedIdle
+		due := time.Since(c.loggedAt) > 15*time.Second
+		if changed || due {
+			c.loggedState, c.loggedIdle, c.loggedAt = state, idle, time.Now()
+		}
+		c.sessMu.Unlock()
+		if !changed && !due {
+			continue
+		}
+		logInfo("recv #%d: MEDIA_STATUS session=%d playerState=%s currentTime=%.1fs ahead=%.1fs idleReason=%q", seq, session, state, cur, buffered, idle)
 		if media, ok := s0["media"].(map[string]any); ok {
 			logDebug("recv #%d:   media contentId=%v contentType=%v duration=%v", seq, media["contentId"], media["contentType"], media["duration"])
 		}
