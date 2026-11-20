@@ -26,6 +26,9 @@ import (
 func newTestApp(t *testing.T) (*app, *httptest.Server) {
 	t.Helper()
 	a := &app{token: "secret-token", mediaPort: "0"}
+	// Tests opt in to ffmpeg by setting a.tools themselves.
+	lookupTools = func(string) *tools { return nil }
+	t.Cleanup(func() { lookupTools = findTools })
 	srv := httptest.NewServer(a.controlMux())
 	t.Cleanup(srv.Close)
 	a.controlAddr = srv.Listener.Addr().String()

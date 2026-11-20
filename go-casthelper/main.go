@@ -52,13 +52,17 @@ type app struct {
 	mediaPort   string // port the media server binds to
 	mediaBindIP string // optional override for the media bind/advertise address
 
-	tools      *tools             // ffmpeg/ffprobe, nil if not installed
-	convCancel context.CancelFunc // stops the running conversion, if any
-	convSeq    uint64
+	tools          *tools             // ffmpeg/ffprobe, nil if not installed
+	ffmpegOverride string             // -ffmpeg flag
+	convCancel     context.CancelFunc // stops the running conversion, if any
+	convSeq        uint64
 
 	mediaHits atomic.Uint64 // how many times the device has fetched the media
 	reqSeq    atomic.Uint64 // request counter, for correlating log lines
 }
+
+// lookupTools is replaced in tests that must run without ffmpeg.
+var lookupTools = findTools
 
 // allowLoopbackDevice lets tests cast to a fake device on 127.0.0.1.
 var allowLoopbackDevice = false
@@ -119,11 +123,12 @@ func main() {
 	}
 
 	a := &app{
-		token:       token,
-		controlAddr: *controlAddr,
-		mediaPort:   mediaPort,
-		mediaBindIP: bindIP,
-		tools:       findTools(*ffmpegPath),
+		token:          token,
+		controlAddr:    *controlAddr,
+		mediaPort:      mediaPort,
+		mediaBindIP:    bindIP,
+		tools:          findTools(*ffmpegPath),
+		ffmpegOverride: *ffmpegPath,
 	}
 	if a.tools == nil {
 		logWarn("ffmpeg not found: files the device cannot play directly, and network streams, cannot be cast")
@@ -339,7 +344,7 @@ type castRequest struct {
 	URL    string  `json:"url"`    // http(s) URL of a network stream
 	Title  string  `json:"title"`  // shown on the device
 	Start  float64 `json:"start"`  // position to start at, in seconds
-	Aid    int     `json:"aid"`    // mpv's 1-based audio track id, 0 = default
+	Aid    float64 `json:"aid"`    // mpv's 1-based audio track id, 0 = default
 }
 
 // parseDevice accepts only a literal private/link-local IP (optionally with a
@@ -429,6 +434,13 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 		req.Start = 0
 	}
 
+	// ffmpeg may have been installed since the helper started.
+	a.mu.Lock()
+	if a.tools == nil {
+		a.tools = lookupTools(a.ffmpegOverride)
+	}
+	a.mu.Unlock()
+
 	// Decide whether the device can play the source as it is.
 	var pl *plan
 	contentType := "video/mp4"
@@ -440,7 +452,7 @@ func (a *app) handleCast(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "cannot read the media", http.StatusUnprocessableEntity)
 			return
 		}
-		pl = decide(src, probed, req.Aid)
+		pl = decide(src, probed, int(req.Aid))
 	case src.isURL:
 		http.Error(w, "ffmpeg is required to cast network streams", http.StatusFailedDependency)
 		return

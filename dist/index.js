@@ -130,9 +130,7 @@
 
   // src/index.ts
   var {
-    standaloneWindow,
-    overlay,
-    sidebar,
+    utils: utils2,
     global,
     mpv,
     core,
@@ -228,22 +226,72 @@
       return;
     }
     IINAConsole.log("Casting current media to ", device);
-    core.osd("Chromecast: connecting\u2026");
-    global.postMessage("cast:load", {
+    lastRequest = {
       device,
       ...source,
       title: core.status.title || "IINA",
       start: numberOrZero(() => mpv.getNumber("time-pos")),
       aid: numberOrZero(() => mpv.getNumber("aid"))
-    });
-    casting = true;
+    };
+    sendCast();
     core.pause();
+  }
+  var lastRequest = null;
+  function sendCast() {
+    if (!lastRequest) return;
+    core.osd("Chromecast: connecting\u2026");
+    casting = true;
+    global.postMessage("cast:load", lastRequest);
   }
   global.onMessage("cast:result", (r) => {
     if (!casting) return;
     if (!r.ok) casting = false;
     core.osd(`Chromecast: ${r.message}`);
+    if (r.needsFfmpeg) offerFfmpegInstall();
   });
+  var BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
+  var installingFfmpeg = false;
+  function offerFfmpegInstall() {
+    if (installingFfmpeg) {
+      core.osd("Chromecast: ffmpeg is still installing\u2026");
+      return;
+    }
+    const brew = BREW_PATHS.find((p) => utils2.fileInPath(p));
+    if (!brew) {
+      utils2.ask(
+        "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\nInstall Homebrew from https://brew.sh, run \u201Cbrew install ffmpeg\u201D in Terminal, then cast again."
+      );
+      return;
+    }
+    const ok = utils2.ask(
+      "This video has to be converted before the TV can play it, and that needs ffmpeg.\n\nInstall ffmpeg now with Homebrew? It takes a few minutes; casting starts when it is done."
+    );
+    if (!ok) return;
+    installingFfmpeg = true;
+    core.osd("Chromecast: installing ffmpeg, this takes a few minutes\u2026");
+    const home = utils2.resolvePath("~/").replace(/\/$/, "");
+    utils2.exec("/usr/bin/env", [
+      `HOME=${home}`,
+      "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "NONINTERACTIVE=1",
+      brew,
+      "install",
+      "ffmpeg"
+    ]).then((res) => {
+      installingFfmpeg = false;
+      if (res.status !== 0) {
+        IINAConsole.log(`brew install ffmpeg failed (${res.status}): ${res.stderr.slice(-2e3)}`);
+        core.osd("Chromecast: could not install ffmpeg, see the plugin log");
+        return;
+      }
+      core.osd("Chromecast: ffmpeg installed");
+      sendCast();
+    }).catch((e) => {
+      installingFfmpeg = false;
+      IINAConsole.log(`brew install ffmpeg could not start: ${JSON.stringify(e)}`);
+      core.osd("Chromecast: could not install ffmpeg, see the plugin log");
+    });
+  }
   function stopCasting() {
     if (!casting) return;
     casting = false;

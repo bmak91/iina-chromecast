@@ -14,7 +14,9 @@ In IINA: Settings → Plugins → Install from GitHub, and enter `bmak91/iina-ch
 Restart IINA, open a local video, and pick your device under the plugin menu's
 *Chromecast* entry.
 
-Install ffmpeg as well (`brew install ffmpeg`). Without it only files the device
+Conversion needs ffmpeg. If it is missing when you cast something that has to be
+converted, the plugin asks whether to install it with Homebrew (`brew install ffmpeg`)
+and starts casting when the install is done. Without ffmpeg only files the device
 plays natively (MP4 with H.264/AAC, WebM, common audio files) can be cast.
 
 The first time you cast, macOS may ask whether `casthelper` may accept incoming
@@ -28,7 +30,7 @@ that the binary matches the source:
 
 ```sh
 ./build-helper.sh   # needs Go 1.24.7; prints the SHA-256 of bin/casthelper
-# expected: 827e50de29c4d24154184ad08a71d6dd17f4b7fdc296a2ca0555216aa9d492db
+# expected: cd23796048a7a891d525dac499d5ebfc2bea9cbd2631a2ed725f0f20f8c29f04
 ```
 
 To use a helper you compiled on your own Mac instead, run `./install-helper.sh`.
@@ -68,7 +70,7 @@ IINA. Seeking in IINA while converting restarts the conversion at the new positi
 | Any path and any target host were accepted. | Only regular files with a media extension are served. The device must be a private or link-local IP address. |
 | The plugin downloaded an unsigned `casthelper` binary from the upstream repo's *latest* release and ran it at every IINA launch. | Nothing is downloaded at runtime. The helper ships in the repo and its build is reproducible from the source. |
 | – | ffmpeg is started with an argument array (no shell) and a protocol whitelist: a network stream cannot make it open local files, and a local file cannot make it reach the network. |
-| `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `network-request`, `file-system`. |
+| `allowedDomains: ["*"]`, plus unused permissions. | `allowedDomains: ["127.0.0.1"]`; only `show-osd`, `show-alert`, `network-request`, `file-system`. |
 | A debug log of file paths and titles was appended forever to a world-readable file in the temp dir. | Logs go to stderr at info level. `-log` is opt-in and creates the file `0600`. |
 | No way to stop casting from IINA. | *Stop Casting* menu item. Casting also stops when the window closes. |
 

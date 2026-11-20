@@ -46,25 +46,25 @@
   }
   function failureMessage(e) {
     const status = e && e.statusCode;
-    if (status === 424) return "install ffmpeg to cast this (brew install ffmpeg)";
+    if (status === 424) return "ffmpeg is needed to convert this video";
     if (status === 422) return "cannot read this media";
     if (status === 0) return "helper is not running";
     const text = e && typeof e.text === "string" ? e.text.trim() : "";
     return text ? `failed: ${text}` : "failed";
   }
-  function load(d) {
+  function load(d, player) {
+    const reply = (r) => {
+      if (player) global.postMessage(player, "cast:result", r);
+    };
     post("/cast", d).then((res) => {
       const converting = /"mode":\s*"convert"/.test(res && res.text || "");
-      global.postMessage(null, "cast:result", {
-        ok: true,
-        message: converting ? "casting (converting on the fly)" : "casting"
-      });
+      reply({ ok: true, message: converting ? "casting (converting on the fly)" : "casting" });
     }).catch((e) => {
       IINAConsole.log(`casthelper /cast failed: ${JSON.stringify(e)}`);
-      global.postMessage(null, "cast:result", { ok: false, message: failureMessage(e) });
+      reply({ ok: false, message: failureMessage(e), needsFfmpeg: !!e && e.statusCode === 424 });
     });
   }
-  global.onMessage("cast:load", (d) => load(d));
+  global.onMessage("cast:load", (d, player) => load(d, player));
   global.onMessage("cast:pause", () => quiet("/pause"));
   global.onMessage("cast:play", () => quiet("/play"));
   global.onMessage("cast:seek", (d) => quiet("/seek", d));
