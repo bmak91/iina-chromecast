@@ -294,9 +294,15 @@ func (a *app) serveSubtitles(w http.ResponseWriter, r *http.Request, job *subtit
 	w.Write(shiftVTT(job.vtt, delay-offset, job.req.linePercent()))
 }
 
-// streamStart returns where a converted stream that was asked to start at
-// `start` really begins. Copied video begins on the keyframe at or before
-// that position; everything else begins exactly there.
+// streamStart returns the source time that becomes time zero of a converted
+// stream asked to start at `start`. Subtitles are shifted by exactly this.
+//
+// A re-encoded stream begins at the requested position. A stream with copied
+// video begins wherever the container seek lands: on the keyframe at or before
+// the position, and usually a little earlier still, because the audio packets
+// stored just ahead of that keyframe are kept and the muxer moves the video
+// back by its B-frame delay. ffprobe performs the same seek, so the first
+// packets it returns show where that is.
 func (t *tools) streamStart(src source, p *plan, start float64) float64 {
 	if start <= 0 || p == nil || !p.hasVideo || !p.copyVideo || t.ffprobe == "" {
 		return start
@@ -306,21 +312,47 @@ func (t *tools) streamStart(src source, p *plan, start float64) float64 {
 	out, err := exec.CommandContext(ctx, t.ffprobe,
 		"-v", "error",
 		"-protocol_whitelist", protocolWhitelist(src.isURL),
-		"-select_streams", "v:0",
-		"-read_intervals", strconv.FormatFloat(start, 'f', 3, 64)+"%+#1",
-		"-show_entries", "packet=pts_time",
+		"-read_intervals", strconv.FormatFloat(start, 'f', 3, 64)+"%+#60",
+		"-show_entries", "packet=stream_index,pts_time,dts_time",
 		"-of", "csv=p=0",
 		"-i", src.location).Output()
 	if err != nil {
 		return start
 	}
-	fields := strings.Fields(strings.ReplaceAll(string(out), ",", " "))
-	if len(fields) == 0 {
+	zero, found := start, false
+	seenVideo, seenAudio := false, false
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) < 3 {
+			continue
+		}
+		idx, err := strconv.Atoi(f[0])
+		pts, err2 := strconv.ParseFloat(f[1], 64)
+		if err != nil || err2 != nil {
+			continue
+		}
+		var ts float64
+		switch {
+		case idx == p.videoIndex && !seenVideo:
+			seenVideo = true
+			ts = pts - p.reorderDelay
+			if dts, err := strconv.ParseFloat(f[2], 64); err == nil && dts <= pts {
+				ts = dts
+			}
+		case idx == p.audioIndex && !seenAudio:
+			seenAudio = true
+			ts = pts
+		default:
+			continue
+		}
+		if !found || ts < zero {
+			zero, found = ts, true
+		}
+	}
+	// At the very beginning of a file the result is slightly negative: the
+	// stream starts at 0 and the video is shown a B-frame delay later.
+	if !seenVideo || zero < -1 || zero > start {
 		return start
 	}
-	k, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil || k < 0 || k > start {
-		return start
-	}
-	return k
+	return zero
 }

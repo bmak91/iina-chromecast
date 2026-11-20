@@ -31,6 +31,9 @@ type plan struct {
 	hasVideo  bool    // false for audio-only sources
 	audio     int     // 0-based index of the audio track to send
 	duration  float64 // seconds, 0 if unknown
+
+	videoIndex, audioIndex int     // stream numbers in the source, -1 if none
+	reorderDelay           float64 // seconds the muxer delays video to make room for B-frames
 }
 
 // tools locates ffmpeg/ffprobe. The helper is started by IINA with an empty
@@ -152,6 +155,8 @@ type probeStream struct {
 	CodecName   string `json:"codec_name"`
 	PixFmt      string `json:"pix_fmt"`
 	Transfer    string `json:"color_transfer"`
+	BFrames     int    `json:"has_b_frames"`
+	FrameRate   string `json:"avg_frame_rate"`
 	Disposition struct {
 		AttachedPic int `json:"attached_pic"`
 	} `json:"disposition"`
@@ -223,7 +228,7 @@ func (t *tools) probe(src source) (*probeResult, error) {
 	cmd := exec.CommandContext(ctx, t.ffprobe,
 		"-v", "error",
 		"-protocol_whitelist", protocolWhitelist(src.isURL),
-		"-show_entries", "stream=index,codec_type,codec_name,pix_fmt,color_transfer:stream_disposition=attached_pic:format=format_name,duration",
+		"-show_entries", "stream=index,codec_type,codec_name,pix_fmt,color_transfer,has_b_frames,avg_frame_rate:stream_disposition=attached_pic:format=format_name,duration",
 		"-of", "json",
 		"-i", src.location)
 	var stderr bytes.Buffer
@@ -246,25 +251,35 @@ func decide(src source, r *probeResult, aid int) *plan {
 	var video, audio string
 	var pixFmt, transfer string
 	audioCount := 0
+	var audioIndexes []int
+	videoIndex, reorderDelay := -1, 0.0
 	for _, s := range r.Streams {
 		switch s.CodecType {
 		case "video":
 			if s.Disposition.AttachedPic == 0 && video == "" {
 				video, pixFmt, transfer = s.CodecName, s.PixFmt, s.Transfer
+				videoIndex = s.Index
+				if fps := parseRate(s.FrameRate); fps > 0 && s.BFrames > 0 && s.BFrames <= 16 {
+					reorderDelay = float64(s.BFrames) / fps
+				}
 			}
 		case "audio":
 			if audio == "" {
 				audio = s.CodecName
 			}
+			audioIndexes = append(audioIndexes, s.Index)
 			audioCount++
 		}
 	}
-	p := &plan{hasVideo: video != ""}
+	p := &plan{hasVideo: video != "", videoIndex: videoIndex, audioIndex: -1, reorderDelay: reorderDelay}
 	if d, err := strconv.ParseFloat(r.Format.Duration, 64); err == nil && d > 0 {
 		p.duration = d
 	}
 	if aid >= 1 && aid <= audioCount {
 		p.audio = aid - 1
+	}
+	if p.audio < len(audioIndexes) {
+		p.audioIndex = audioIndexes[p.audio]
 	}
 	h264OK := video == "h264" && (pixFmt == "yuv420p" || pixFmt == "yuvj420p")
 	p.copyVideo = h264OK
@@ -288,6 +303,23 @@ func decide(src source, r *probeResult, aid int) *plan {
 		return nil
 	}
 	return p
+}
+
+// parseRate reads a frame rate such as "24000/1001".
+func parseRate(s string) float64 {
+	num, den, ok := strings.Cut(s, "/")
+	n, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0
+	}
+	if !ok {
+		return n
+	}
+	d, err := strconv.ParseFloat(den, 64)
+	if err != nil || d == 0 {
+		return 0
+	}
+	return n / d
 }
 
 var directAudio = map[string]string{

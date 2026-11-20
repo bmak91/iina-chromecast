@@ -723,8 +723,9 @@ func TestSubtitlesFromSeparateFileFollowIINASettings(t *testing.T) {
 	if hdr.Get("Access-Control-Allow-Origin") != "*" {
 		t.Errorf("subtitle response has no CORS header")
 	}
-	// Source cue at 12.0 s, +0.5 s delay, on a stream that starts at 10 s.
-	if !strings.Contains(vtt, "00:00:02.500 --> 00:00:04.500 line:70%") || !strings.Contains(vtt, "Hello") {
+	// Source cue at 12.0 s, +0.5 s delay, on a stream whose keyframe at 10 s
+	// is shown 0.08 s in (two frames of B-frame delay).
+	if !strings.Contains(vtt, "00:00:02.580 --> 00:00:04.580 line:70%") || !strings.Contains(vtt, "Hello") {
 		t.Errorf("cue not shifted/placed as expected:\n%s", vtt)
 	}
 	if strings.Contains(vtt, "Before the keyframe") {
@@ -737,7 +738,7 @@ func TestSubtitlesFromSeparateFileFollowIINASettings(t *testing.T) {
 	}
 	<-loaded
 	subsURL, _ = trackOf(t)
-	if _, vtt, _ := httpGetText(t, subsURL); !strings.Contains(vtt, "00:00:12.500 --> 00:00:14.500") || !strings.Contains(vtt, "Before the keyframe") {
+	if _, vtt, _ := httpGetText(t, subsURL); !strings.Contains(vtt, "00:00:12.580 --> 00:00:14.580") || !strings.Contains(vtt, "Before the keyframe") {
 		t.Errorf("after seek:\n%s", vtt)
 	}
 	do(t, "POST", srv.URL+"/stop", "", tok)
@@ -829,5 +830,55 @@ func TestHDRVideoIsToneMappedWhenReencoded(t *testing.T) {
 	r, _ := tl.probe(source{location: sdr})
 	if p := decide(source{location: sdr}, r, 0); p == nil || p.hdr {
 		t.Errorf("SDR plan = %+v", p)
+	}
+}
+
+// The subtitle shift must equal the real start of the converted stream. Check
+// the prediction against where a known source frame lands in actual output.
+func TestStreamStartMatchesConvertedOutput(t *testing.T) {
+	tl := testTools(t)
+	dir := t.TempDir()
+	movie := filepath.Join(dir, "film.mkv")
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=30:size=320x240:rate=24000/1001",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=30",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "240", "-bf", "3", "-pix_fmt", "yuv420p", "-c:a", "ac3", movie}
+	if b, err := exec.Command(tl.ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Skipf("cannot create sample: %v: %s", err, b)
+	}
+	mp4 := filepath.Join(dir, "film.mp4")
+	if b, err := exec.Command(tl.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", movie, "-c:v", "copy", "-c:a", "aac", mp4).CombinedOutput(); err != nil {
+		t.Skipf("cannot create sample: %v: %s", err, b)
+	}
+	for _, file := range []string{movie, mp4} {
+		src := source{location: file}
+		r, err := tl.probe(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := decide(src, r, 0)
+		if p == nil {
+			p = &plan{hasVideo: true, videoIndex: 0, audioIndex: 1}
+		}
+		p.copyVideo = true
+		const start = 12.5
+		zero := tl.streamStart(src, p, start)
+
+		// Source time of the keyframe the stream starts on.
+		o, _ := exec.Command(tl.ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "12.5%+#1",
+			"-show_entries", "packet=pts_time", "-of", "csv=p=0", file).Output()
+		key, _ := strconv.ParseFloat(strings.Trim(strings.TrimSpace(string(o)), ","), 64)
+
+		out := filepath.Join(dir, "out.mp4")
+		a := tl.ffmpegArgs(src, p, start)
+		a[len(a)-1] = out
+		if b, err := exec.Command(tl.ffmpeg, append([]string{"-y"}, a...)...).CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg: %v: %s", err, b)
+		}
+		got := firstPTS(t, tl, out, "v:0") // where that keyframe is shown in the output
+		if want := key - zero; got-want > 0.03 || got-want < -0.03 {
+			t.Errorf("%s: keyframe at source %.3fs is shown at %.3fs, predicted %.3fs (stream start %.3fs)",
+				filepath.Base(file), key, got, want, zero)
+		}
 	}
 }
